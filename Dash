@@ -1,0 +1,2576 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+================================================================================
+ RT REQUIREMENTS & TEST-CASE TRACEABILITY DASHBOARD
+================================================================================
+
+A single Plotly-Dash application that serves TWO dashboards from one port,
+switchable with the top-level tabs:
+
+    * "Requirements" tab  - reads the Requirements workbooks (one sub-folder per
+      project) and draws the five requirement graphs
+      (Distribution / Validation / Trace / ASIL / CAL).
+
+    * "Test Case" tab     - reads the Test-Case workbooks under ``D:/Test_Cases``
+      (one sub-folder per module, each a mini sub-tab) and draws NINE graphs
+      (Status / Result / Test Case Type / Test Criteria / Valuation /
+       Responsible User / ASIL / CAL / Regression Test).
+
+Both tabs share the same generic machinery - the differences live entirely in a
+small set of dataclasses (``Dimension`` and ``Domain``), which is what keeps the
+code industrial-grade rather than copy-pasted.
+
+--------------------------------------------------------------------------------
+ WHAT CHANGED IN THIS REVISION (and why it matters)
+--------------------------------------------------------------------------------
+1. SCALE / "stuck on loading" fix.  The previous design read *every* workbook on
+   start-up.  With hundreds or thousands of files that blocked the UI and the
+   graphs appeared to hang on "Loading...".  The DataStore is now **lazy**: it
+   only *discovers* files on disk (cheap filename parsing, no reading) and then
+   reads **only the handful of workbooks a given view actually needs**
+   (<= 10 days, <= 10 weekly days, <= 10 monthly days).  Reads run in parallel
+   and are cached by (mtime,size).  Ten thousand files on disk still means only
+   ~10 reads per view - so no graph is ever stuck loading.
+
+2. DATE FORMAT.  Workbook file names (and every x-axis label) now use
+   ``DD-MON-YY`` - e.g. ``26-OCT-26``.  The old ``DD-MM-YYYY`` names still parse,
+   so nothing breaks.
+
+3. WEEKLY / MONTHLY are now SINGLE-DAY, not aggregates:
+     * Weekly  -> the Saturday of each ISO week; if that Saturday has no file,
+                  the Friday; if neither exists, that week is skipped.
+     * Monthly -> the last available date in each calendar month.
+
+4. "TEST CASE TYPE" graph added to the Test Case tab (column "Test Case Type":
+   Manual = dark blue, Automated = light blue).
+
+5. PER-BAR, PER-GRAPH "no data".  If a given workbook is missing the column a
+   particular graph needs, ONLY that graph's bar for that date is drawn empty
+   with a small "no data" note - every other graph, and every other date, is
+   unaffected.
+
+6. TOTAL COUNT printed on top of every bar, on BOTH tabs.
+
+--------------------------------------------------------------------------------
+ USAGE
+--------------------------------------------------------------------------------
+    python app.py                         # serve both dashboards on :8050
+    python app.py --root PATH             # Requirements root folder
+    python app.py --tc-root PATH          # Test-Case root folder
+    python app.py --demo                  # write sample data under both roots
+    python app.py --selftest              # run the internal logic assertions
+    python app.py --rendercheck --demo    # PROVE the graphs render (headless)
+
+Author : Cowork / Claude
+License : MIT
+================================================================================
+"""
+
+from __future__ import annotations
+
+# --------------------------------------------------------------------------- #
+#  Standard library imports                                                    #
+# --------------------------------------------------------------------------- #
+import os
+import re
+import sys
+import math
+import time
+import hmac
+import socket
+import logging
+import argparse
+import colorsys
+import threading
+import datetime as dt
+import concurrent.futures as cf
+from dataclasses import dataclass, field
+from collections import OrderedDict
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+
+# --------------------------------------------------------------------------- #
+#  Third-party imports (defensive, with actionable error messages)            #
+# --------------------------------------------------------------------------- #
+try:
+    import numpy as np
+    import pandas as pd
+except Exception as exc:  # pragma: no cover
+    sys.stderr.write(
+        "\n[FATAL] pandas / numpy are required but could not be imported.\n"
+        "        Install them with:  pip install pandas numpy openpyxl\n"
+        f"        Underlying error: {exc}\n"
+    )
+    raise
+
+try:
+    import plotly.graph_objects as go
+except Exception as exc:  # pragma: no cover
+    sys.stderr.write(
+        "\n[FATAL] plotly is required but could not be imported.\n"
+        "        Install it with:  pip install plotly\n"
+        f"        Underlying error: {exc}\n"
+    )
+    raise
+
+try:
+    from dash import Dash, dcc, html, Input, Output, State, ctx
+    from dash.exceptions import PreventUpdate
+    _DASH_AVAILABLE = True
+except Exception:  # pragma: no cover - optional at import time
+    _DASH_AVAILABLE = False
+
+
+# --------------------------------------------------------------------------- #
+#  Logging                                                                     #
+# --------------------------------------------------------------------------- #
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("rt_dashboard")
+
+
+# =========================================================================== #
+#  SECTION 1 - CONFIGURATION & CONSTANTS                                       #
+# =========================================================================== #
+
+#: Requirements root: one sub-folder per project, each holding dated workbooks.
+DEFAULT_RT_ROOT: str = os.environ.get("RT_ROOT", os.path.join("d", "rt"))
+
+#: Test-Case root: one sub-folder per module, each holding dated workbooks.
+#: Defaults to ``D:/Test_Cases`` as requested (overridable with --tc-root / TC_ROOT).
+DEFAULT_TC_ROOT: str = os.environ.get("TC_ROOT", os.path.join("D:" + os.sep, "Test_Cases"))
+
+#: Simple HTTP Basic-Auth credentials used when the dashboard is shared on a LAN.
+DASH_USERNAME: str = os.environ.get("RT_USERNAME", "brks")
+DASH_PASSWORD: str = os.environ.get("RT_PASSWORD", "tyu@uui133")
+
+#: Count columns strictly below this threshold are clamped to 0 (Requirements).
+COUNT_THRESHOLD: float = 0.9
+
+#: Maximum number of bars (periods) shown on any graph at once.
+MAX_BARS: int = 10
+
+#: Fixed bar width (data units); the x-axis is pinned to a 10-slot range so bars
+#: stay narrow and identically sized regardless of how many bars are present.
+BAR_WIDTH: float = 0.55
+
+#: How many workbooks to read concurrently when a view needs several files.
+READ_WORKERS: int = min(16, (os.cpu_count() or 4) * 2)
+
+#: Cap for the "custom dates" dropdown so it stays responsive with 1000+ files.
+CUSTOM_DATE_OPTION_CAP: int = 300
+
+#: Extensions we will attempt to read as Excel-like workbooks (.csv as a bonus).
+EXCEL_EXTENSIONS: Tuple[str, ...] = (
+    ".xlsx", ".xlsm", ".xltx", ".xltm", ".xls", ".xlsb", ".csv",
+)
+
+#: Date formats accepted in workbook *file names*.  DD-MON-YY (26-OCT-26) is the
+#: current contract; DD-MM-YYYY and friends are kept for backward compatibility.
+FILENAME_DATE_FORMATS: Tuple[str, ...] = (
+    "%d-%b-%y", "%d-%b-%Y", "%d_%b_%y", "%d_%b_%Y", "%d %b %y", "%d %b %Y",
+    "%d-%m-%Y", "%d_%m_%Y", "%d.%m.%Y", "%d %m %Y",
+    "%d-%m-%y", "%d_%m_%y", "%d.%m.%y",
+)
+
+#: How dates are shown on x-axis ticks and in the custom-date picker (DD-MON-YY).
+DATE_FMT: str = "%d-%b-%y"
+
+
+def fmt_date(d: dt.date) -> str:
+    """Render a date as the canonical ``DD-MON-YY`` label, e.g. ``26-OCT-26``."""
+    return d.strftime(DATE_FMT).upper()
+
+
+# =========================================================================== #
+#  SECTION 1b - COLOURS                                                        #
+# =========================================================================== #
+
+def _clamp01(x: float) -> float:
+    return 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
+
+
+def _generate_blue_shades(n: int = 30) -> Tuple[str, ...]:
+    """Return *n* ordered, visually distinct shades of blue.
+
+    Used for the Test-Case ASIL and CAL graphs, which may have up to 30 distinct
+    values.  Because the assignment is "sorted value -> index -> shade", the same
+    value always receives the same shade across every bar in a tab.
+    """
+    shades: List[str] = []
+    for i in range(n):
+        t = i / float(max(1, n - 1))           # 0 .. 1
+        hue = 0.58 + 0.06 * t                   # ~209deg .. 230deg (stays blue)
+        light = 0.86 - 0.60 * t                 # light -> dark
+        sat = 0.45 + 0.45 * t                   # soft -> rich
+        r, g, b = colorsys.hls_to_rgb(hue, _clamp01(light), _clamp01(sat))
+        shades.append("#%02X%02X%02X" % (int(round(r * 255)),
+                                         int(round(g * 255)),
+                                         int(round(b * 255))))
+    return tuple(shades)
+
+
+#: 30 ordered blue shades for Test-Case ASIL / CAL.
+BLUE_SHADES_30: Tuple[str, ...] = _generate_blue_shades(30)
+
+# ---- Requirements colours (unchanged) ------------------------------------- #
+STATUS_CREATED = "created"
+STATUS_SPECIFIED = "specified"
+STATUS_ACCEPTED = "accepted"
+STATUS_OTHERS = "others"
+WORK_STATUSES: Tuple[str, ...] = (STATUS_CREATED, STATUS_SPECIFIED, STATUS_ACCEPTED)
+DIST_STATUS_ORDER: Tuple[str, ...] = (
+    STATUS_ACCEPTED, STATUS_SPECIFIED, STATUS_CREATED, STATUS_OTHERS,
+)
+TARGET_CATEGORIES: Tuple[str, ...] = (
+    "functional requirement", "non-functional requirement",
+)
+
+COLOR_DIST: Dict[str, str] = {
+    STATUS_ACCEPTED: "#0B6623",   # dark green
+    STATUS_SPECIFIED: "#9BE08B",  # light green
+    STATUS_CREATED: "#FFD93B",    # yellow
+    STATUS_OTHERS: "#9E9E9E",     # grey
+}
+COLOR_VALIDATION: Dict[str, str] = {
+    "Validated": "#39FF14",       # neon green
+    "Not Validated": "#FF073A",   # neon red
+}
+COLOR_TRACE: Dict[str, str] = {
+    "Pass": "#0B6623",            # dark green
+    "Fail": "#8B0000",            # dark red
+    "Not Tested": "#FFA500",      # orange
+}
+COLOR_ASIL: Dict[str, str] = {
+    "QM": "#FFF6A8",              # light yellow
+    "tbd": "#FFCE93",             # light orange
+    "blank": "#FFB3B3",           # light red
+    "ASIL": "#39FF14",            # neon green
+}
+CAL_PALETTE: Tuple[str, ...] = (
+    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+    "#8c564b", "#e377c2", "#17becf", "#bcbd22", "#7f7f7f",
+)
+CAL_BLANK_LABEL = "N/A"
+
+# ---- Test-Case colours ----------------------------------------------------- #
+# Status: accepted=dark blue, created=light blue, deleted=navy, n/a=normal blue,
+#         specified=neon blue, blank=grey (+ an "other" safety bucket).
+COLOR_TC_STATUS: Dict[str, str] = {
+    "accepted": "#00008B",    # dark blue
+    "specified": "#1F51FF",   # neon blue
+    "created": "#ADD8E6",     # light blue
+    "deleted": "#191970",     # navy (midnight) blue
+    "n/a": "#2563EB",         # normal blue
+    "blank": "#9E9E9E",       # grey
+    "other": "#546E7A",       # blue-grey (unexpected values)
+}
+TC_STATUS_ORDER: Tuple[str, ...] = (
+    "accepted", "specified", "created", "deleted", "n/a", "blank", "other",
+)
+
+# Result (column "Last Result"): Failed=dark red, Passed=dark green,
+#         Skipped=orange, Not run=yellow, blank=grey (+ "other" safety).
+COLOR_TC_RESULT: Dict[str, str] = {
+    "Passed": "#0B6623",      # dark green
+    "Failed": "#8B0000",      # dark red
+    "Skipped": "#FFA500",     # orange
+    "Not run": "#FFD93B",     # yellow
+    "blank": "#9E9E9E",       # grey
+    "other": "#616161",       # dark grey (unexpected values)
+}
+TC_RESULT_ORDER: Tuple[str, ...] = (
+    "Passed", "Failed", "Skipped", "Not run", "blank", "other",
+)
+
+# Test Case Type: Manual=dark blue, Automated=light blue (+ safety buckets).
+COLOR_TC_TYPE: Dict[str, str] = {
+    "Manual": "#00008B",      # dark blue
+    "Automated": "#ADD8E6",   # light blue
+    "blank": "#9E9E9E",       # grey
+    "other": "#546E7A",       # blue-grey
+}
+TC_TYPE_ORDER: Tuple[str, ...] = ("Manual", "Automated", "blank", "other")
+
+# Set / Not Set (Test Criteria, Valuation, Responsible User).
+COLOR_TC_SETNESS: Dict[str, str] = {
+    "Set": "#2E7D32",         # green
+    "Not Set": "#C62828",     # red
+}
+TC_SETNESS_ORDER: Tuple[str, ...] = ("Set", "Not Set")
+
+# Regression Test: Pass=green, False=red, blank=grey, anything else=NIL=black.
+COLOR_TC_REGRESSION: Dict[str, str] = {
+    "Pass": "#2E7D32",        # green
+    "False": "#C62828",       # red
+    "blank": "#9E9E9E",       # grey
+    "NIL": "#000000",         # black
+}
+TC_REGRESSION_ORDER: Tuple[str, ...] = ("Pass", "False", "NIL", "blank")
+
+
+# =========================================================================== #
+#  SECTION 1c - CANONICAL COLUMNS & ALIASES                                    #
+# =========================================================================== #
+
+# ---- Requirements canonical keys ------------------------------------------ #
+CANON_CATEGORY = "category"
+CANON_STATUS = "status"
+CANON_VALIDATED_BY = "validated_by"
+CANON_CAL = "cal"
+CANON_ASIL = "asil"
+CANON_PASS = "pass_count"
+CANON_FAIL = "fail_count"
+CANON_TRACE = "trace_count"
+CANON_TRACEABILITY = "traceability"
+
+COLUMN_ALIASES: Dict[str, str] = {
+    "category": CANON_CATEGORY,
+    "status": CANON_STATUS,
+    "validated by": CANON_VALIDATED_BY,
+    "validatedby": CANON_VALIDATED_BY,
+    "cal": CANON_CAL,
+    "asil": CANON_ASIL,
+    "validated by pass count": CANON_PASS,
+    "validated by fail count": CANON_FAIL,
+    "validated by trace count": CANON_TRACE,
+    "validated pass count": CANON_PASS,
+    "validated fail count": CANON_FAIL,
+    "validated trace count": CANON_TRACE,
+    "pass count": CANON_PASS,
+    "fail count": CANON_FAIL,
+    "trace count": CANON_TRACE,
+    "traceability": CANON_TRACEABILITY,
+}
+
+# ---- Test-Case canonical keys --------------------------------------------- #
+TC_CANON_CATEGORY = "tc_category"
+TC_CANON_STATUS = "tc_status"
+TC_CANON_LAST_RESULT = "tc_last_result"
+TC_CANON_TYPE = "tc_type"
+TC_CANON_TEST_CRITERIA = "tc_test_criteria"
+TC_CANON_VALIDATED = "tc_validated"
+TC_CANON_RESPONSIBLE = "tc_responsible"
+TC_CANON_ASIL = "tc_asil"
+TC_CANON_CAL = "tc_cal"
+TC_CANON_REGRESSION = "tc_regression"
+
+TC_COLUMN_ALIASES: Dict[str, str] = {
+    "category": TC_CANON_CATEGORY,
+    "status": TC_CANON_STATUS,
+    "last result": TC_CANON_LAST_RESULT,
+    "lastresult": TC_CANON_LAST_RESULT,
+    "result": TC_CANON_LAST_RESULT,
+    "test case type": TC_CANON_TYPE,
+    "testcasetype": TC_CANON_TYPE,
+    "test criteria": TC_CANON_TEST_CRITERIA,
+    "testcriteria": TC_CANON_TEST_CRITERIA,
+    "validated": TC_CANON_VALIDATED,
+    "validated by": TC_CANON_VALIDATED,
+    "responsible user": TC_CANON_RESPONSIBLE,
+    "responsibleuser": TC_CANON_RESPONSIBLE,
+    "responsible": TC_CANON_RESPONSIBLE,
+    "asil": TC_CANON_ASIL,
+    "cal": TC_CANON_CAL,
+    "regression test": TC_CANON_REGRESSION,
+    "regressiontest": TC_CANON_REGRESSION,
+    "regression": TC_CANON_REGRESSION,
+}
+
+
+# =========================================================================== #
+#  SECTION 1d - DIMENSION & DOMAIN DATACLASSES                                 #
+# =========================================================================== #
+
+@dataclass(frozen=True)
+class Dimension:
+    """Static description of one graph.
+
+    ``order``/``colors`` define a fixed-value graph; ``order is None`` makes the
+    graph data-driven (values discovered from the data, coloured from ``palette``).
+
+    ``need_all`` / ``need_any`` drive the per-bar "no data" behaviour: a bar is
+    drawn as "no data" when, for that date's workbook(s), not all of ``need_all``
+    are present, or (when ``need_any`` is non-empty) none of ``need_any`` are.
+    """
+    key: str
+    title: str
+    row_field: str                                  # processed column to count
+    scope: str                                      # "all" | "category" | "work"
+    order: Optional[Tuple[str, ...]] = None         # fixed order, or None=dynamic
+    colors: Optional[Dict[str, str]] = None         # fixed colours, or None
+    palette: Optional[Tuple[str, ...]] = None       # palette for dynamic dims
+    full_width: bool = False                         # span both grid columns
+    need_all: Tuple[str, ...] = ()                   # canon cols that must exist
+    need_any: Tuple[str, ...] = ()                   # at least one must exist
+
+
+@dataclass
+class Domain:
+    """Everything that distinguishes one dashboard tab from the other."""
+    key: str
+    title: str
+    root: str
+    dimensions: "OrderedDict[str, Dimension]"
+    dimension_order: Tuple[str, ...]
+    processor: Callable[[pd.DataFrame, str, dt.date, str],
+                        Tuple[pd.DataFrame, Set[str]]]
+    processed_columns: Tuple[str, ...]
+    aliases: Dict[str, str]
+    category_canon: str
+    target_categories: Tuple[str, ...]
+    target_label: str
+    keep_default_na: bool = True
+
+
+# ---- Requirements dimensions ---------------------------------------------- #
+DIM_DISTRIBUTION = "distribution"
+DIM_VALIDATION = "validation"
+DIM_TRACE = "trace"
+DIM_ASIL = "asil"
+DIM_CAL = "cal"
+DIMENSION_ORDER: Tuple[str, ...] = (
+    DIM_DISTRIBUTION, DIM_VALIDATION, DIM_TRACE, DIM_ASIL, DIM_CAL,
+)
+
+DIMENSIONS: "OrderedDict[str, Dimension]" = OrderedDict()
+DIMENSIONS[DIM_DISTRIBUTION] = Dimension(
+    key=DIM_DISTRIBUTION, title="Distribution", row_field="status_bucket",
+    scope="category", order=DIST_STATUS_ORDER, colors=COLOR_DIST,
+    need_all=(CANON_CATEGORY, CANON_STATUS),
+)
+DIMENSIONS[DIM_VALIDATION] = Dimension(
+    key=DIM_VALIDATION, title="Validation", row_field="validation",
+    scope="work", order=("Validated", "Not Validated"), colors=COLOR_VALIDATION,
+    need_all=(CANON_CATEGORY, CANON_VALIDATED_BY),
+)
+DIMENSIONS[DIM_TRACE] = Dimension(
+    key=DIM_TRACE, title="Trace", row_field="traceability_bucket",
+    scope="work", order=("Pass", "Fail", "Not Tested"), colors=COLOR_TRACE,
+    need_all=(CANON_CATEGORY,),
+    need_any=(CANON_PASS, CANON_FAIL, CANON_TRACE, CANON_TRACEABILITY),
+)
+DIMENSIONS[DIM_ASIL] = Dimension(
+    key=DIM_ASIL, title="ASIL", row_field="asil_bucket",
+    scope="work", order=("QM", "tbd", "blank", "ASIL"), colors=COLOR_ASIL,
+    need_all=(CANON_CATEGORY, CANON_ASIL),
+)
+DIMENSIONS[DIM_CAL] = Dimension(
+    key=DIM_CAL, title="CAL", row_field="cal_value",
+    scope="work", order=None, colors=None, palette=CAL_PALETTE, full_width=True,
+    need_all=(CANON_CATEGORY, CANON_CAL),
+)
+
+#: Columns the Requirements processor tracks for presence.
+REQUIRED_CANON: Tuple[str, ...] = (
+    CANON_CATEGORY, CANON_STATUS, CANON_VALIDATED_BY, CANON_CAL, CANON_ASIL,
+    CANON_PASS, CANON_FAIL, CANON_TRACE,
+)
+PROCESSED_COLUMNS: Tuple[str, ...] = (
+    "folder", "date", "source_file",
+    "status_bucket", "in_work",
+    "validation", "traceability_bucket", "asil_bucket", "cal_value",
+    "pass_count", "fail_count", "trace_count",
+)
+
+# ---- Test-Case dimensions -------------------------------------------------- #
+TC_DIM_STATUS = "tc_status"
+TC_DIM_RESULT = "tc_result"
+TC_DIM_TYPE = "tc_type"
+TC_DIM_TESTCRIT = "tc_testcrit"
+TC_DIM_VALUATION = "tc_valuation"
+TC_DIM_RESPONSIBLE = "tc_responsible"
+TC_DIM_ASIL = "tc_asil"
+TC_DIM_CAL = "tc_cal"
+TC_DIM_REGRESSION = "tc_regression"
+TC_DIMENSION_ORDER: Tuple[str, ...] = (
+    TC_DIM_STATUS, TC_DIM_RESULT, TC_DIM_TYPE, TC_DIM_TESTCRIT,
+    TC_DIM_VALUATION, TC_DIM_RESPONSIBLE, TC_DIM_ASIL, TC_DIM_CAL,
+    TC_DIM_REGRESSION,
+)
+
+TC_DIMENSIONS: "OrderedDict[str, Dimension]" = OrderedDict()
+TC_DIMENSIONS[TC_DIM_STATUS] = Dimension(
+    key=TC_DIM_STATUS, title="Status", row_field="status_value", scope="all",
+    order=TC_STATUS_ORDER, colors=COLOR_TC_STATUS,
+    need_all=(TC_CANON_CATEGORY, TC_CANON_STATUS),
+)
+TC_DIMENSIONS[TC_DIM_RESULT] = Dimension(
+    key=TC_DIM_RESULT, title="Result", row_field="result_value", scope="all",
+    order=TC_RESULT_ORDER, colors=COLOR_TC_RESULT,
+    need_all=(TC_CANON_CATEGORY, TC_CANON_LAST_RESULT),
+)
+TC_DIMENSIONS[TC_DIM_TYPE] = Dimension(
+    key=TC_DIM_TYPE, title="Test Case Type", row_field="type_value", scope="all",
+    order=TC_TYPE_ORDER, colors=COLOR_TC_TYPE,
+    need_all=(TC_CANON_CATEGORY, TC_CANON_TYPE),
+)
+TC_DIMENSIONS[TC_DIM_TESTCRIT] = Dimension(
+    key=TC_DIM_TESTCRIT, title="Test Criteria", row_field="test_criteria_set",
+    scope="all", order=TC_SETNESS_ORDER, colors=COLOR_TC_SETNESS,
+    need_all=(TC_CANON_CATEGORY, TC_CANON_TEST_CRITERIA),
+)
+TC_DIMENSIONS[TC_DIM_VALUATION] = Dimension(
+    key=TC_DIM_VALUATION, title="Valuation", row_field="validated_set",
+    scope="all", order=TC_SETNESS_ORDER, colors=COLOR_TC_SETNESS,
+    need_all=(TC_CANON_CATEGORY, TC_CANON_VALIDATED),
+)
+TC_DIMENSIONS[TC_DIM_RESPONSIBLE] = Dimension(
+    key=TC_DIM_RESPONSIBLE, title="Responsible User", row_field="responsible_set",
+    scope="all", order=TC_SETNESS_ORDER, colors=COLOR_TC_SETNESS,
+    need_all=(TC_CANON_CATEGORY, TC_CANON_RESPONSIBLE),
+)
+TC_DIMENSIONS[TC_DIM_ASIL] = Dimension(
+    key=TC_DIM_ASIL, title="ASIL", row_field="asil_value", scope="all",
+    order=None, colors=None, palette=BLUE_SHADES_30,
+    need_all=(TC_CANON_CATEGORY, TC_CANON_ASIL),
+)
+TC_DIMENSIONS[TC_DIM_CAL] = Dimension(
+    key=TC_DIM_CAL, title="CAL", row_field="cal_value", scope="all",
+    order=None, colors=None, palette=BLUE_SHADES_30,
+    need_all=(TC_CANON_CATEGORY, TC_CANON_CAL),
+)
+TC_DIMENSIONS[TC_DIM_REGRESSION] = Dimension(
+    key=TC_DIM_REGRESSION, title="Regression Test", row_field="regression_value",
+    scope="all", order=TC_REGRESSION_ORDER, colors=COLOR_TC_REGRESSION,
+    need_all=(TC_CANON_CATEGORY, TC_CANON_REGRESSION),
+)
+
+TC_PROCESSED_COLUMNS: Tuple[str, ...] = (
+    "folder", "date", "source_file",
+    "status_value", "result_value", "type_value",
+    "test_criteria_set", "validated_set", "responsible_set",
+    "asil_value", "cal_value", "regression_value",
+)
+
+
+# =========================================================================== #
+#  SECTION 2 - LOW-LEVEL NORMALISATION HELPERS                                 #
+# =========================================================================== #
+
+_WS_RE = re.compile(r"\s+")
+
+
+def normalize_text(value: Any) -> str:
+    """Lower-cased, whitespace-collapsed, stripped string ('' for NaN/None)."""
+    if value is None:
+        return ""
+    if isinstance(value, float) and math.isnan(value):
+        return ""
+    try:
+        text = str(value)
+    except Exception:
+        return ""
+    text = text.replace("\u00a0", " ")             # non-breaking space -> space
+    text = _WS_RE.sub(" ", text).strip().lower()
+    if text in ("nan", "none", "null", "<na>"):
+        return ""
+    return text
+
+
+def normalize_header(value: Any) -> str:
+    """Normalise a column header for alias matching (same rules as cells)."""
+    return normalize_text(value)
+
+
+def is_blank(value: Any) -> bool:
+    """True when a cell should be treated as empty/blank."""
+    return normalize_text(value) == ""
+
+
+# =========================================================================== #
+#  SECTION 3 - FILE DISCOVERY & DATE PARSING                                   #
+# =========================================================================== #
+
+_NUM_DATE_RE = re.compile(r"(\d{1,2})[-_.\s](\d{1,2})[-_.\s](\d{2,4})")
+_ALPHA_DATE_RE = re.compile(r"(\d{1,2})[-_.\s]([A-Za-z]{3,})[-_.\s](\d{2,4})")
+
+
+def parse_date_from_filename(filename: str) -> Optional[dt.date]:
+    """Extract a :class:`datetime.date` from a workbook file name.
+
+    Primary contract is ``DD-MON-YY`` (26-OCT-26); ``DD-MM-YYYY`` and several
+    separators / 2-digit years are also tolerated, both as a whole-stem parse and
+    via an embedded-token regex fallback.
+    """
+    stem = os.path.splitext(os.path.basename(filename))[0].strip()
+
+    # 1) Whole-stem parse against every accepted format.
+    for fmt in FILENAME_DATE_FORMATS:
+        try:
+            return dt.datetime.strptime(stem, fmt).date()
+        except ValueError:
+            continue
+
+    # 2) Alpha-month token embedded in the name (e.g. report_26-OCT-26_final).
+    m = _ALPHA_DATE_RE.search(stem)
+    if m:
+        token = f"{int(m.group(1)):02d}-{m.group(2)}-{m.group(3)}"
+        for fmt in ("%d-%b-%y", "%d-%b-%Y"):
+            try:
+                return dt.datetime.strptime(token, fmt).date()
+            except ValueError:
+                continue
+
+    # 3) Numeric token embedded in the name (e.g. report_31-12-2025_final).
+    m = _NUM_DATE_RE.search(stem)
+    if m:
+        token = f"{int(m.group(1)):02d}-{int(m.group(2)):02d}-{m.group(3)}"
+        for fmt in ("%d-%m-%Y", "%d-%m-%y"):
+            try:
+                return dt.datetime.strptime(token, fmt).date()
+            except ValueError:
+                continue
+    return None
+
+
+def is_temp_or_hidden(path: str) -> bool:
+    """True for Office lock files (``~$...``) and hidden dot-files."""
+    name = os.path.basename(path)
+    return name.startswith("~$") or name.startswith(".")
+
+
+def discover_folders(root: str) -> List[str]:
+    """Sorted list of immediate sub-folder names inside *root* (one per tab)."""
+    if not os.path.isdir(root):
+        log.warning("Root directory does not exist: %s", os.path.abspath(root))
+        return []
+    out = []
+    try:
+        entries = sorted(os.listdir(root))
+    except OSError as exc:
+        log.warning("Cannot list root %s: %s", root, exc)
+        return []
+    for entry in entries:
+        full = os.path.join(root, entry)
+        if os.path.isdir(full):
+            out.append(entry)
+    return out
+
+
+def discover_workbooks(root: str, folder: str) -> List[Tuple[str, dt.date]]:
+    """Find every dated workbook inside ``root/folder`` (no reading).
+
+    Returns ``(absolute_path, date)`` sorted by date ascending.  Undated and
+    temp/hidden files are skipped.  This is deliberately cheap so it scales to
+    thousands of files.
+    """
+    folder_path = os.path.join(root, folder)
+    results: List[Tuple[str, dt.date]] = []
+    if not os.path.isdir(folder_path):
+        return results
+    try:
+        entries = sorted(os.listdir(folder_path))
+    except OSError as exc:
+        log.warning("Cannot list folder %s: %s", folder_path, exc)
+        return results
+    for entry in entries:
+        full = os.path.join(folder_path, entry)
+        if is_temp_or_hidden(full) or not os.path.isfile(full):
+            continue
+        if os.path.splitext(entry)[1].lower() not in EXCEL_EXTENSIONS:
+            continue
+        file_date = parse_date_from_filename(entry)
+        if file_date is None:
+            log.debug("Skipping (no parseable date): %s", full)
+            continue
+        results.append((full, file_date))
+    results.sort(key=lambda item: item[1])
+    return results
+
+
+def _read_excel_with_engine(path: str, ext: str,
+                            keep_default_na: bool = True) -> pd.DataFrame:
+    """Read a single workbook (first sheet), choosing the best engine."""
+    ext = ext.lower()
+
+    if ext == ".csv":
+        for sep in (",", ";", "\t"):
+            try:
+                df = pd.read_csv(path, sep=sep, dtype=object,
+                                 keep_default_na=keep_default_na,
+                                 na_filter=keep_default_na, engine="python")
+                if df.shape[1] > 1:
+                    return df
+            except Exception:
+                continue
+        return pd.read_csv(path, dtype=object, keep_default_na=keep_default_na,
+                           na_filter=keep_default_na)
+
+    if ext in (".xlsx", ".xlsm", ".xltx", ".xltm"):
+        engine_plan: List[Optional[str]] = ["openpyxl", None]
+    elif ext == ".xls":
+        engine_plan = ["xlrd", None, "openpyxl"]
+    elif ext == ".xlsb":
+        engine_plan = ["pyxlsb", None]
+    else:
+        engine_plan = [None, "openpyxl", "xlrd", "pyxlsb"]
+
+    last_error: Optional[Exception] = None
+    for engine in engine_plan:
+        try:
+            return pd.read_excel(path, sheet_name=0, dtype=object, engine=engine,
+                                 keep_default_na=keep_default_na)
+        except ImportError as exc:
+            last_error = exc
+            log.debug("Engine %r unavailable for %s (%s)", engine, path, exc)
+            continue
+        except Exception as exc:
+            last_error = exc
+            log.debug("Engine %r failed for %s (%s)", engine, path, exc)
+            continue
+    raise RuntimeError(f"Could not read workbook {path!r} with any available "
+                       f"engine. Last error: {last_error}")
+
+
+def read_workbook(path: str, keep_default_na: bool = True) -> pd.DataFrame:
+    """Read one workbook into a DataFrame with original headers.
+
+    ``keep_default_na=False`` keeps strings such as ``N/A`` literal (so the
+    Test-Case Status graph can tell a real ``N/A`` from a truly empty cell).
+    """
+    ext = os.path.splitext(path)[1].lower()
+    df = _read_excel_with_engine(path, ext, keep_default_na=keep_default_na)
+    if df is None:
+        raise RuntimeError(f"Workbook {path!r} produced no data frame")
+    return df.dropna(axis=0, how="all")
+
+
+def build_canonical_column_map(columns: Sequence[Any],
+                               aliases: Optional[Dict[str, str]] = None
+                               ) -> Dict[str, str]:
+    """Map canonical-key -> actual-source-column for one workbook."""
+    aliases = aliases if aliases is not None else COLUMN_ALIASES
+    mapping: Dict[str, str] = {}
+    for col in columns:
+        canon = aliases.get(normalize_header(col))
+        if canon and canon not in mapping:
+            mapping[canon] = col
+    return mapping
+
+
+# =========================================================================== #
+#  SECTION 4 - PER-CELL CLASSIFICATION LOGIC                                   #
+# =========================================================================== #
+
+# ---- Requirements (unchanged behaviour) ----------------------------------- #
+def is_target_category(value: Any) -> bool:
+    return normalize_text(value) in TARGET_CATEGORIES
+
+
+def bucket_status(value: Any) -> str:
+    s = normalize_text(value)
+    if s == STATUS_CREATED:
+        return STATUS_CREATED
+    if s == STATUS_SPECIFIED:
+        return STATUS_SPECIFIED
+    if s == STATUS_ACCEPTED:
+        return STATUS_ACCEPTED
+    return STATUS_OTHERS
+
+
+def apply_threshold(value: Any) -> float:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if math.isnan(v):
+        return 0.0
+    return v if v >= COUNT_THRESHOLD else 0.0
+
+
+def compute_traceability(pass_count: float, fail_count: float,
+                         trace_count: float) -> str:
+    if fail_count != 0:
+        return "Fail"
+    if pass_count != 0:
+        return "Pass"
+    return "Not Tested"
+
+
+def normalize_existing_traceability(value: Any) -> str:
+    s = normalize_text(value)
+    if s == "":
+        return ""
+    if "fail" in s:
+        return "Fail"
+    if "pass" in s:
+        return "Pass"
+    if ("not" in s and "test" in s) or s in ("nt", "untested", "not_tested"):
+        return "Not Tested"
+    return str(value).strip()
+
+
+def classify_validation(value: Any) -> str:
+    return "Not Validated" if is_blank(value) else "Validated"
+
+
+def bucket_asil(value: Any) -> str:
+    if is_blank(value):
+        return "blank"
+    s = normalize_text(value)
+    if "qm" in s:
+        return "QM"
+    if s == "tbd":
+        return "tbd"
+    return "ASIL"
+
+
+def classify_cal(value: Any) -> str:
+    if is_blank(value):
+        return CAL_BLANK_LABEL
+    return str(value).strip()
+
+
+# ---- Test-Case classification --------------------------------------------- #
+def is_tc_target_category(value: Any) -> bool:
+    """Only 'Software Test Level 1' rows are processed on the Test-Case tab."""
+    return normalize_text(value) == "software test level 1"
+
+
+def bucket_tc_status(value: Any) -> str:
+    s = normalize_text(value)
+    if s == "":
+        return "blank"
+    if s == "accepted":
+        return "accepted"
+    if s == "created":
+        return "created"
+    if s == "deleted":
+        return "deleted"
+    if s in ("n/a", "na"):
+        return "n/a"
+    if s == "specified":
+        return "specified"
+    return "other"
+
+
+def bucket_tc_result(value: Any) -> str:
+    s = normalize_text(value)
+    if s == "":
+        return "blank"
+    t = s.replace("_", " ").replace("-", " ")
+    if "fail" in s:
+        return "Failed"
+    if "pass" in s:
+        return "Passed"
+    if "skip" in s:
+        return "Skipped"
+    if "not run" in t or "notrun" in s:
+        return "Not run"
+    return "other"
+
+
+def bucket_tc_type(value: Any) -> str:
+    s = normalize_text(value)
+    if s == "":
+        return "blank"
+    if "manual" in s:
+        return "Manual"
+    if "auto" in s:                 # matches "automated" / "automatic"
+        return "Automated"
+    return "other"
+
+
+def tc_set_or_not(value: Any) -> str:
+    """'Set' when the cell holds anything, else 'Not Set'."""
+    return "Not Set" if is_blank(value) else "Set"
+
+
+def tc_dynamic_value(value: Any) -> str:
+    """ASIL / CAL value as a trimmed string, or the blank label if empty."""
+    if is_blank(value):
+        return CAL_BLANK_LABEL
+    return str(value).strip()
+
+
+def bucket_tc_regression(value: Any) -> str:
+    s = normalize_text(value)
+    if s == "":
+        return "blank"
+    if s == "false":
+        return "False"
+    if "pass" in s:
+        return "Pass"
+    return "NIL"
+
+
+# =========================================================================== #
+#  SECTION 5 - WORKBOOK -> PROCESSED ROW FRAME                                 #
+# =========================================================================== #
+
+def _series_for(df: pd.DataFrame, mapping: Dict[str, str], canon: str,
+                default: Any = np.nan) -> pd.Series:
+    """Source Series for a canonical key, or a default-filled one if absent."""
+    col = mapping.get(canon)
+    if col is None or col not in df.columns:
+        return pd.Series([default] * len(df), index=df.index)
+    return df[col]
+
+
+def process_workbook(raw: pd.DataFrame, folder: str, file_date: dt.date,
+                     source_file: str) -> Tuple[pd.DataFrame, Set[str]]:
+    """Requirements: raw workbook -> (tidy FR/NFR rows, present-column set)."""
+    if raw is None or raw.empty:
+        return pd.DataFrame(columns=PROCESSED_COLUMNS), set()
+
+    mapping = build_canonical_column_map(raw.columns, COLUMN_ALIASES)
+    present: Set[str] = set(mapping.keys())
+
+    category = _series_for(raw, mapping, CANON_CATEGORY)
+    is_target_mask = category.map(is_target_category).to_numpy(dtype=bool)
+    if not is_target_mask.any():
+        return pd.DataFrame(columns=PROCESSED_COLUMNS), present
+
+    status = _series_for(raw, mapping, CANON_STATUS)
+    validated_by = _series_for(raw, mapping, CANON_VALIDATED_BY)
+    cal = _series_for(raw, mapping, CANON_CAL)
+    asil = _series_for(raw, mapping, CANON_ASIL)
+    pass_raw = _series_for(raw, mapping, CANON_PASS, default=0)
+    fail_raw = _series_for(raw, mapping, CANON_FAIL, default=0)
+    trace_raw = _series_for(raw, mapping, CANON_TRACE, default=0)
+    had_traceability = CANON_TRACEABILITY in mapping
+    trace_existing = _series_for(raw, mapping, CANON_TRACEABILITY, default="")
+
+    status_bucket = status.map(bucket_status)
+    in_work_mask = is_target_mask & status_bucket.isin(WORK_STATUSES).to_numpy(bool)
+
+    pass_v = pass_raw.map(apply_threshold)
+    fail_v = fail_raw.map(apply_threshold)
+    trace_v = trace_raw.map(apply_threshold)
+
+    if had_traceability:
+        trace_bucket = trace_existing.map(normalize_existing_traceability)
+    else:
+        trace_bucket = pd.Series(
+            [compute_traceability(p, f, t)
+             for p, f, t in zip(pass_v.to_numpy(), fail_v.to_numpy(),
+                                 trace_v.to_numpy())],
+            index=raw.index,
+        )
+
+    out = pd.DataFrame({
+        "folder": folder,
+        "date": file_date,
+        "source_file": os.path.basename(source_file),
+        "status_bucket": status_bucket.to_numpy(),
+        "in_work": in_work_mask,
+        "validation": validated_by.map(classify_validation).to_numpy(),
+        "traceability_bucket": trace_bucket.to_numpy(),
+        "asil_bucket": asil.map(bucket_asil).to_numpy(),
+        "cal_value": cal.map(classify_cal).to_numpy(),
+        "pass_count": pass_v.to_numpy(),
+        "fail_count": fail_v.to_numpy(),
+        "trace_count": trace_v.to_numpy(),
+    }, index=raw.index)
+    out = out.loc[is_target_mask].reset_index(drop=True)
+    return out, present
+
+
+def process_test_case_workbook(raw: pd.DataFrame, folder: str,
+                               file_date: dt.date, source_file: str
+                               ) -> Tuple[pd.DataFrame, Set[str]]:
+    """Test-Case: raw workbook -> (tidy 'Software Test Level 1' rows, present)."""
+    if raw is None or raw.empty:
+        return pd.DataFrame(columns=TC_PROCESSED_COLUMNS), set()
+
+    mapping = build_canonical_column_map(raw.columns, TC_COLUMN_ALIASES)
+    present: Set[str] = set(mapping.keys())
+
+    category = _series_for(raw, mapping, TC_CANON_CATEGORY)
+    is_target = category.map(is_tc_target_category).to_numpy(dtype=bool)
+    if not is_target.any():
+        return pd.DataFrame(columns=TC_PROCESSED_COLUMNS), present
+
+    status = _series_for(raw, mapping, TC_CANON_STATUS)
+    last_result = _series_for(raw, mapping, TC_CANON_LAST_RESULT)
+    tc_type = _series_for(raw, mapping, TC_CANON_TYPE)
+    test_crit = _series_for(raw, mapping, TC_CANON_TEST_CRITERIA)
+    validated = _series_for(raw, mapping, TC_CANON_VALIDATED)
+    responsible = _series_for(raw, mapping, TC_CANON_RESPONSIBLE)
+    asil = _series_for(raw, mapping, TC_CANON_ASIL)
+    cal = _series_for(raw, mapping, TC_CANON_CAL)
+    regression = _series_for(raw, mapping, TC_CANON_REGRESSION)
+
+    out = pd.DataFrame({
+        "folder": folder,
+        "date": file_date,
+        "source_file": os.path.basename(source_file),
+        "status_value": status.map(bucket_tc_status).to_numpy(),
+        "result_value": last_result.map(bucket_tc_result).to_numpy(),
+        "type_value": tc_type.map(bucket_tc_type).to_numpy(),
+        "test_criteria_set": test_crit.map(tc_set_or_not).to_numpy(),
+        "validated_set": validated.map(tc_set_or_not).to_numpy(),
+        "responsible_set": responsible.map(tc_set_or_not).to_numpy(),
+        "asil_value": asil.map(tc_dynamic_value).to_numpy(),
+        "cal_value": cal.map(tc_dynamic_value).to_numpy(),
+        "regression_value": regression.map(bucket_tc_regression).to_numpy(),
+    }, index=raw.index)
+    out = out.loc[is_target].reset_index(drop=True)
+    return out, present
+
+
+# =========================================================================== #
+#  SECTION 6 - DOMAIN FACTORY                                                  #
+# =========================================================================== #
+
+def build_domains(req_root: str, tc_root: str) -> List[Domain]:
+    """Construct the two dashboards' Domain descriptions for the given roots."""
+    requirements = Domain(
+        key="requirements", title="Requirements", root=req_root,
+        dimensions=DIMENSIONS, dimension_order=DIMENSION_ORDER,
+        processor=process_workbook, processed_columns=PROCESSED_COLUMNS,
+        aliases=COLUMN_ALIASES, category_canon=CANON_CATEGORY,
+        target_categories=TARGET_CATEGORIES,
+        target_label="Functional Requirement / Non-Functional Requirement",
+        keep_default_na=True,
+    )
+    test_case = Domain(
+        key="test_case", title="Test Case", root=tc_root,
+        dimensions=TC_DIMENSIONS, dimension_order=TC_DIMENSION_ORDER,
+        processor=process_test_case_workbook,
+        processed_columns=TC_PROCESSED_COLUMNS,
+        aliases=TC_COLUMN_ALIASES, category_canon=TC_CANON_CATEGORY,
+        target_categories=("software test level 1",),
+        target_label="Software Test Level 1",
+        keep_default_na=False,
+    )
+    return [requirements, test_case]
+
+
+# =========================================================================== #
+#  SECTION 7 - DATA STORE (lazy discovery + on-demand parallel reads)          #
+# =========================================================================== #
+
+@dataclass
+class LoadedDates:
+    """Rows + per-date column presence for a specific set of requested dates."""
+    rows: pd.DataFrame
+    presence: Dict[dt.date, Set[str]]
+    errors: List[str] = field(default_factory=list)
+
+
+class DataStore:
+    """Owns a domain's files and serves rows on demand.
+
+    Discovery (which files exist and their dates) is cheap and done eagerly.
+    Reading/processing a workbook is expensive, so it is deferred until a view
+    asks for a particular date, then cached by (mtime, size).  This is what lets
+    a folder with thousands of workbooks render instantly: any view needs at most
+    ~10 files.
+    """
+
+    def __init__(self, domain: Domain) -> None:
+        self.domain = domain
+        self.root = domain.root
+        self._lock = threading.RLock()
+        #: folder -> list of (path, date), sorted by date
+        self._folder_files: "OrderedDict[str, List[Tuple[str, dt.date]]]" = OrderedDict()
+        #: folder -> date -> list of paths for that date
+        self._date_index: Dict[str, Dict[dt.date, List[str]]] = {}
+        #: path -> (signature, processed_frame, present_set)
+        self._file_cache: Dict[str, Tuple[Tuple[float, int], pd.DataFrame, Set[str]]] = {}
+        self.last_scanned: Optional[dt.datetime] = None
+        self.scan_count: int = 0
+
+    # --------------------------------------------------------------------- #
+    #  Discovery (cheap)                                                     #
+    # --------------------------------------------------------------------- #
+    def scan(self) -> None:
+        """(Re)discover folders and files on disk.  Reads no workbook content."""
+        with self._lock:
+            t0 = time.time()
+            folder_names = discover_folders(self.root)
+            new_files: "OrderedDict[str, List[Tuple[str, dt.date]]]" = OrderedDict()
+            new_index: Dict[str, Dict[dt.date, List[str]]] = {}
+            seen: Set[str] = set()
+
+            for folder in folder_names:
+                files = discover_workbooks(self.root, folder)
+                new_files[folder] = files
+                idx: Dict[dt.date, List[str]] = {}
+                for path, d in files:
+                    idx.setdefault(d, []).append(path)
+                    seen.add(path)
+                new_index[folder] = idx
+
+            # Drop cache entries for files no longer present.
+            for stale in [p for p in self._file_cache if p not in seen]:
+                self._file_cache.pop(stale, None)
+
+            self._folder_files = new_files
+            self._date_index = new_index
+            self.last_scanned = dt.datetime.now()
+            self.scan_count += 1
+            n_files = sum(len(v) for v in new_files.values())
+            log.info("[%s] discovered %d folder(s), %d file(s) in %.3fs (scan #%d)",
+                     self.domain.key, len(new_files), n_files,
+                     time.time() - t0, self.scan_count)
+
+    # --------------------------------------------------------------------- #
+    #  Read API (expensive, lazy, cached, parallel)                         #
+    # --------------------------------------------------------------------- #
+    @staticmethod
+    def _signature(path: str) -> Tuple[float, int]:
+        st = os.stat(path)
+        return (st.st_mtime, st.st_size)
+
+    def _read_one(self, folder: str, path: str, file_date: dt.date
+                  ) -> Tuple[pd.DataFrame, Set[str], Optional[str]]:
+        """Read+process one file (cached).  Returns (frame, present, error)."""
+        try:
+            sig = self._signature(path)
+        except OSError as exc:
+            return (pd.DataFrame(columns=self.domain.processed_columns), set(),
+                    f"{os.path.basename(path)}: stat failed ({exc})")
+
+        cached = self._file_cache.get(path)
+        if cached is not None and cached[0] == sig:
+            return cached[1], cached[2], None
+
+        try:
+            raw = read_workbook(path, keep_default_na=self.domain.keep_default_na)
+            frame, present = self.domain.processor(raw, folder, file_date, path)
+        except Exception as exc:
+            log.warning("[%s] failed to process %s: %s",
+                        self.domain.key, path, exc)
+            empty = pd.DataFrame(columns=self.domain.processed_columns)
+            # Cache the failure so a broken file is not retried every render.
+            self._file_cache[path] = (sig, empty, set())
+            return empty, set(), f"{os.path.basename(path)}: {exc}"
+
+        self._file_cache[path] = (sig, frame, present)
+        return frame, present, None
+
+    def load_dates(self, folder: str, dates: Sequence[dt.date]) -> LoadedDates:
+        """Read+process ONLY the files for the requested dates (in parallel)."""
+        with self._lock:
+            idx = dict(self._date_index.get(folder, {}))
+        # Build the concrete read list (path, date) for the requested dates.
+        jobs: List[Tuple[str, str, dt.date]] = []
+        for d in dates:
+            for path in idx.get(d, []):
+                jobs.append((folder, path, d))
+
+        frames: List[pd.DataFrame] = []
+        presence: Dict[dt.date, Set[str]] = {d: set() for d in dates}
+        errors: List[str] = []
+
+        if not jobs:
+            empty = pd.DataFrame(columns=self.domain.processed_columns)
+            return LoadedDates(rows=empty, presence=presence, errors=errors)
+
+        def _do(job: Tuple[str, str, dt.date]):
+            fld, pth, dte = job
+            frame, present, err = self._read_one(fld, pth, dte)
+            return dte, frame, present, err
+
+        if len(jobs) == 1:
+            results = [_do(jobs[0])]
+        else:
+            with cf.ThreadPoolExecutor(max_workers=READ_WORKERS) as ex:
+                results = list(ex.map(_do, jobs))
+
+        for dte, frame, present, err in results:
+            presence.setdefault(dte, set()).update(present)
+            if frame is not None and not frame.empty:
+                frames.append(frame)
+            if err:
+                errors.append(f"[{folder}] {err}")
+
+        if frames:
+            rows = pd.concat(frames, ignore_index=True)
+            rows["date"] = pd.to_datetime(rows["date"]).dt.date
+        else:
+            rows = pd.DataFrame(columns=self.domain.processed_columns)
+        return LoadedDates(rows=rows, presence=presence, errors=errors)
+
+    # --------------------------------------------------------------------- #
+    #  Light metadata queries (no reading)                                  #
+    # --------------------------------------------------------------------- #
+    def folder_names(self) -> List[str]:
+        with self._lock:
+            return list(self._folder_files.keys())
+
+    def folder_dates(self, folder: str) -> List[dt.date]:
+        with self._lock:
+            return sorted(self._date_index.get(folder, {}).keys())
+
+    def folder_file_count(self, folder: str) -> int:
+        with self._lock:
+            return len(self._folder_files.get(folder, []))
+
+    def total_files(self) -> int:
+        with self._lock:
+            return sum(len(v) for v in self._folder_files.values())
+
+    def summary(self) -> str:
+        when = self.last_scanned.strftime("%Y-%m-%d %H:%M:%S") if self.last_scanned else "never"
+        with self._lock:
+            n_folders = len(self._folder_files)
+            n_files = sum(len(v) for v in self._folder_files.values())
+        return (f"Scanning: {os.path.abspath(self.root)}  |  "
+                f"{n_folders} folder(s), {n_files} file(s)  |  "
+                f"last scanned: {when}")
+
+    # --------------------------------------------------------------------- #
+    #  Diagnostics - explain why a folder may look empty.                   #
+    # --------------------------------------------------------------------- #
+    def _column_report(self, path: str) -> List[str]:
+        out: List[str] = []
+        try:
+            raw = read_workbook(path, keep_default_na=self.domain.keep_default_na)
+        except Exception as exc:
+            return [f"        (could not open {os.path.basename(path)}: {exc})"]
+        cols = [str(c) for c in raw.columns]
+        mapping = build_canonical_column_map(raw.columns, self.domain.aliases)
+        out.append(f"        headers in file : {cols}")
+        out.append(f"        recognised cols : "
+                   f"{mapping if mapping else '(NONE recognised!)'}")
+        if self.domain.category_canon not in mapping:
+            out.append("        >> No 'Category' column was recognised. Rows are "
+                       f"kept only where Category is {self.domain.target_label}. "
+                       "Rename your column to 'Category'.")
+            return out
+        catcol = mapping[self.domain.category_canon]
+        sample = sorted({normalize_text(v) for v in raw[catcol].tolist()
+                         if normalize_text(v)})[:12]
+        out.append(f"        Category values : {sample}")
+        if not any(v in self.domain.target_categories for v in sample):
+            out.append("        >> None of the Category values match "
+                       f"{self.domain.target_label}, so every row is filtered "
+                       "out. Fix the Category values (or check the file).")
+        return out
+
+    def diagnostics(self, sample_reads: bool = True) -> str:
+        """Human-readable report of what was found on disk for this domain."""
+        lines: List[str] = []
+        lines.append(f"Scanned root (absolute): {os.path.abspath(self.root)}")
+        lines.append(f"  folder exists on disk : {os.path.isdir(self.root)}")
+        with self._lock:
+            folders = list(self._folder_files.items())
+        if not folders:
+            lines.append("  No project sub-folders were found under the root.")
+            lines.append("  Expected layout:  <root>/<Name>/<DD-MON-YY>.xlsx")
+            return "\n".join(lines)
+        for name, files in folders:
+            dates = sorted({d for _, d in files})
+            rng = (f"{fmt_date(dates[0])} .. {fmt_date(dates[-1])}"
+                   if dates else "no dated files")
+            lines.append(f"  [{name}] files={len(files)}  dates={rng}")
+            if sample_reads and files:
+                # Read just the newest file to explain a possibly-empty folder.
+                newest = max(files, key=lambda it: it[1])[0]
+                frame, _present, err = self._read_one(name, newest,
+                                                      max(d for _, d in files))
+                if err:
+                    lines.append(f"      ! newest file error: {err}")
+                elif frame is None or frame.empty:
+                    lines.append("      -> newest file matched 0 rows. Inspecting:")
+                    lines.extend(self._column_report(newest))
+        return "\n".join(lines)
+
+
+# =========================================================================== #
+#  SECTION 8 - PERIOD BUILDING (daily / weekly / monthly / custom)            #
+# =========================================================================== #
+
+MODE_DAILY = "daily"
+MODE_WEEKLY = "weekly"
+MODE_MONTHLY = "monthly"
+MODE_CUSTOM = "custom"
+
+MODE_OPTIONS = [
+    {"label": "Daily (last 10 days)", "value": MODE_DAILY},
+    {"label": "Weekly (last 10 weeks - Sat/Fri)", "value": MODE_WEEKLY},
+    {"label": "Monthly (last 10 months - last day)", "value": MODE_MONTHLY},
+    {"label": "Custom (pick 1-10 dates)", "value": MODE_CUSTOM},
+]
+
+
+@dataclass(frozen=True)
+class Period:
+    """One bar: a label plus the (single) date it represents."""
+    key: str
+    label: str
+    dates: Tuple[dt.date, ...]
+    kind: str
+
+
+def _take_last(items: List[Any], n: int) -> List[Any]:
+    return items[-n:] if len(items) > n else items
+
+
+def build_daily_periods(dates: List[dt.date], today: dt.date) -> List[Period]:
+    """Up to the 10 most-recent available days (<= today), one bar each."""
+    usable = _take_last([d for d in sorted(set(dates)) if d <= today], MAX_BARS)
+    return [Period(key=f"d:{d.isoformat()}", label=fmt_date(d), dates=(d,),
+                   kind=MODE_DAILY) for d in usable]
+
+
+def build_weekly_periods(dates: List[dt.date], today: dt.date) -> List[Period]:
+    """Up to 10 most-recent ISO weeks, each represented by ONE day.
+
+    The representative day is that week's Saturday; if there is no file for the
+    Saturday, the Friday is used instead; if neither exists the week is skipped.
+    """
+    available = {d for d in dates if d <= today}
+    # Group available dates into ISO weeks (so we only consider weeks with data).
+    weeks: "OrderedDict[Tuple[int, int], None]" = OrderedDict()
+    for d in sorted(available):
+        iso = d.isocalendar()
+        weeks[(iso[0], iso[1])] = None
+
+    periods: List[Period] = []
+    for (iso_year, iso_week) in sorted(weeks.keys()):
+        saturday = dt.date.fromisocalendar(iso_year, iso_week, 6)
+        friday = dt.date.fromisocalendar(iso_year, iso_week, 5)
+        if saturday in available and saturday <= today:
+            rep = saturday
+        elif friday in available and friday <= today:
+            rep = friday
+        else:
+            continue                      # neither Sat nor Fri has a file
+        periods.append(Period(
+            key=f"w:{iso_year}-{iso_week:02d}", label=fmt_date(rep),
+            dates=(rep,), kind=MODE_WEEKLY,
+        ))
+    return _take_last(periods, MAX_BARS)
+
+
+def build_monthly_periods(dates: List[dt.date], today: dt.date) -> List[Period]:
+    """Up to 10 most-recent months, each represented by its LAST available day."""
+    available = [d for d in sorted(set(dates)) if d <= today]
+    months: "OrderedDict[Tuple[int, int], dt.date]" = OrderedDict()
+    for d in available:
+        months[(d.year, d.month)] = d     # last write wins -> latest day in month
+
+    ordered = sorted(months.keys())
+    ordered = _take_last(ordered, MAX_BARS)
+    return [Period(key=f"m:{y}-{mn:02d}", label=fmt_date(months[(y, mn)]),
+                   dates=(months[(y, mn)],), kind=MODE_MONTHLY)
+            for (y, mn) in ordered]
+
+
+def _parse_iso(token: str) -> Optional[dt.date]:
+    try:
+        return dt.date.fromisoformat(str(token))
+    except (ValueError, TypeError):
+        return None
+
+
+def build_custom_periods(dates: List[dt.date],
+                         selected: Optional[Sequence[str]]) -> List[Period]:
+    """One bar per user-selected date (1-10)."""
+    if not selected:
+        return []
+    available = set(dates)
+    chosen: List[dt.date] = []
+    for token in selected:
+        d = parse_date_from_filename(str(token)) or _parse_iso(token)
+        if d is not None and d in available:
+            chosen.append(d)
+    chosen = _take_last(sorted(set(chosen)), MAX_BARS)
+    return [Period(key=f"c:{d.isoformat()}", label=fmt_date(d), dates=(d,),
+                   kind=MODE_CUSTOM) for d in chosen]
+
+
+def build_periods(dates: List[dt.date], mode: str, today: dt.date,
+                  custom: Optional[Sequence[str]] = None) -> List[Period]:
+    if mode == MODE_WEEKLY:
+        return build_weekly_periods(dates, today)
+    if mode == MODE_MONTHLY:
+        return build_monthly_periods(dates, today)
+    if mode == MODE_CUSTOM:
+        return build_custom_periods(dates, custom)
+    return build_daily_periods(dates, today)
+
+
+# =========================================================================== #
+#  SECTION 9 - AGGREGATION & CROSS-FILTER COUNTING                            #
+# =========================================================================== #
+
+def _scope_mask(df: pd.DataFrame, scope: str) -> pd.Series:
+    """Boolean mask selecting the rows a dimension is allowed to see.
+
+    ``work`` uses the ``in_work`` flag (Requirements only); ``all``/``category``
+    select every retained row.
+    """
+    if scope == "work" and "in_work" in df.columns:
+        return df["in_work"].astype(bool)
+    return pd.Series(True, index=df.index)
+
+
+def period_rows(folder_rows: pd.DataFrame, period: Period) -> pd.DataFrame:
+    if folder_rows is None or folder_rows.empty:
+        return folder_rows
+    return folder_rows[folder_rows["date"].isin(set(period.dates))]
+
+
+def segment_counts(rows: pd.DataFrame, dim: Dimension,
+                   restrict_field: Optional[str] = None,
+                   restrict_value: Optional[str] = None) -> Dict[str, int]:
+    if rows is None or rows.empty or dim.row_field not in rows.columns:
+        return {}
+    df = rows
+    if restrict_field is not None and restrict_value is not None:
+        if restrict_field not in df.columns:
+            return {}
+        df = df[df[restrict_field] == restrict_value]
+        if df.empty:
+            return {}
+    df = df[_scope_mask(df, dim.scope)]
+    if df.empty:
+        return {}
+    counts = df[dim.row_field].value_counts()
+    return {str(k): int(v) for k, v in counts.items()}
+
+
+def apply_cross_filter(rows: pd.DataFrame, source_dim: Dimension,
+                       value: Any) -> pd.DataFrame:
+    if rows is None or rows.empty or source_dim.row_field not in rows.columns:
+        return rows
+    df = rows[_scope_mask(rows, source_dim.scope)]
+    return df[df[source_dim.row_field] == value]
+
+
+def discover_dynamic_values(folder_rows: pd.DataFrame, dim: Dimension) -> List[str]:
+    """Distinct values of a dynamic dimension (sorted; blank label last)."""
+    if folder_rows is None or folder_rows.empty or dim.row_field not in folder_rows.columns:
+        return []
+    df = folder_rows[_scope_mask(folder_rows, dim.scope)]
+    if df.empty:
+        return []
+    vals = {str(v) for v in df[dim.row_field].dropna().tolist() if str(v) != ""}
+    return sorted(vals, key=lambda s: (s == CAL_BLANK_LABEL, s.lower()))
+
+
+def resolve_dimension_values(dim: Dimension, folder_rows: pd.DataFrame
+                             ) -> Tuple[List[str], Dict[str, str]]:
+    """(ordered values, colour map) for a dimension - fixed or data-driven."""
+    if dim.order is not None:
+        return list(dim.order), dict(dim.colors or {})
+    values = discover_dynamic_values(folder_rows, dim)
+    palette = dim.palette or CAL_PALETTE
+    colors = {v: palette[i % len(palette)] for i, v in enumerate(values)}
+    return values, colors
+
+
+# =========================================================================== #
+#  SECTION 10 - FIGURE BUILDERS                                                #
+# =========================================================================== #
+
+GRAPH_HEIGHT = 330
+GRID_COLOR = "#ECECEC"
+AXIS_COLOR = "#444444"
+FONT_FAMILY = "Segoe UI, Roboto, Helvetica, Arial, sans-serif"
+
+
+def empty_figure(title: str, message: str = "No data") -> go.Figure:
+    fig = go.Figure()
+    fig.update_layout(
+        title=dict(text=title, x=0.5, xanchor="center",
+                   font=dict(size=16, family=FONT_FAMILY)),
+        height=GRAPH_HEIGHT,
+        margin=dict(l=45, r=12, t=44, b=40),
+        xaxis=dict(visible=False), yaxis=dict(visible=False),
+        plot_bgcolor="white", paper_bgcolor="white", showlegend=False,
+        annotations=[dict(text=message, x=0.5, y=0.5, xref="paper", yref="paper",
+                          showarrow=False, font=dict(size=14, color="#888888"))],
+    )
+    return fig
+
+
+def _period_present(presence: Dict[dt.date, Set[str]], period: Period) -> Set[str]:
+    out: Set[str] = set()
+    for d in period.dates:
+        out |= presence.get(d, set())
+    return out
+
+
+def _bar_has_no_data(dim: Dimension, present: Set[str]) -> bool:
+    """True when a dimension's required columns are absent for a bar's file(s)."""
+    if any(c not in present for c in dim.need_all):
+        return True
+    if dim.need_any and not any(c in present for c in dim.need_any):
+        return True
+    return False
+
+
+def build_stacked_figure(folder: str, folder_rows: pd.DataFrame,
+                         periods: List[Period], dim_key: str,
+                         active_filter: Optional[Dict[str, Any]],
+                         dimensions: "OrderedDict[str, Dimension]",
+                         presence: Dict[dt.date, Set[str]]) -> go.Figure:
+    """Build one dimension's stacked-bar figure.
+
+    Honours: fixed narrow bars on a 10-slot axis; no legend; exact colours;
+    click-to-cross-filter (selected bar recomputed for the clicked subset, the
+    rest dimmed); a total printed on top of every bar; and a per-bar "no data"
+    note when this graph's source column is missing from that date's workbook.
+    """
+    dim = dimensions[dim_key]
+    values, colors = resolve_dimension_values(dim, folder_rows)
+
+    if not periods:
+        return empty_figure(dim.title, "No data for this selection")
+
+    n = len(periods)
+    xs = list(range(n))
+    tick_labels = [p.label for p in periods]
+
+    # Cross-filter state pointed at THIS folder?
+    active_on = bool(active_filter) and active_filter.get("folder") == folder
+    sel_period_key = active_filter.get("period_key") if active_on else None
+    src_dim: Optional[Dimension] = None
+    restrict_value = None
+    filter_descr = ""
+    if active_on:
+        src_dim = dimensions.get(active_filter.get("dim", ""))
+        if src_dim is not None:
+            restrict_value = active_filter.get("value")
+            filter_descr = f"{src_dim.title} = {restrict_value}"
+
+    # Per-period counts, opacity and no-data flags.
+    per_counts: List[Dict[str, int]] = []
+    per_opacity: List[float] = []
+    per_nodata: List[bool] = []
+    for p in periods:
+        present = _period_present(presence, p)
+        nodata = _bar_has_no_data(dim, present)
+        per_nodata.append(nodata)
+        if nodata:
+            per_counts.append({})
+            per_opacity.append(0.28 if active_on else 1.0)
+            continue
+        prows = period_rows(folder_rows, p)
+        if active_on and src_dim is not None and p.key == sel_period_key:
+            sel_rows = apply_cross_filter(prows, src_dim, restrict_value)
+            per_counts.append(segment_counts(sel_rows, dim))
+            per_opacity.append(1.0)
+        else:
+            per_counts.append(segment_counts(prows, dim))
+            per_opacity.append(0.28 if active_on else 1.0)
+
+    fig = go.Figure()
+    for value in values:
+        ys = [counts.get(value, 0) for counts in per_counts]
+        if sum(ys) == 0 and dim.order is None:
+            continue   # skip entirely-absent dynamic values (keeps hover lean)
+        fig.add_trace(go.Bar(
+            x=xs, y=ys, width=BAR_WIDTH, name=str(value),
+            marker=dict(color=colors.get(value, "#999999"),
+                        opacity=per_opacity,
+                        line=dict(width=0.5, color="rgba(0,0,0,0.35)")),
+            customdata=[[p.key, p.label, value] for p in periods],
+            hovertemplate=("<b>%{customdata[2]}</b><br>%{customdata[1]}"
+                           "<br>count = %{y}<extra></extra>"),
+        ))
+
+    # Annotations: optional filter note, per-bar totals, per-bar "no data".
+    annotations: List[dict] = []
+    if active_on and filter_descr:
+        annotations.append(dict(
+            text=f"filtered: {filter_descr}", x=1.0, y=1.06, xref="paper",
+            yref="paper", xanchor="right", showarrow=False,
+            font=dict(size=11, color="#1f77b4"),
+        ))
+
+    totals = [int(sum(c.values())) for c in per_counts]
+    max_total = max(totals) if totals else 0
+    for i, p in enumerate(periods):
+        if per_nodata[i]:
+            annotations.append(dict(
+                x=i, y=0, xref="x", yref="y", text="no data", showarrow=False,
+                xanchor="center", yanchor="bottom", yshift=4, textangle=-90,
+                font=dict(size=10, color="#B91C1C"),
+            ))
+            continue
+        if totals[i] > 0:
+            is_sel = active_on and p.key == sel_period_key
+            annotations.append(dict(
+                x=i, y=totals[i], xref="x", yref="y", text=str(totals[i]),
+                showarrow=False, xanchor="center", yanchor="bottom", yshift=3,
+                font=dict(size=11, family=FONT_FAMILY,
+                          color="#111827" if (not active_on or is_sel) else "#9CA3AF"),
+            ))
+
+    # Transparent headroom point so top labels are never clipped (keeps zoom).
+    if max_total > 0:
+        fig.add_trace(go.Scatter(
+            x=[(n - 1) / 2.0 if n > 0 else 0], y=[max_total * 1.16],
+            mode="markers", marker=dict(size=0, opacity=0),
+            hoverinfo="skip", showlegend=False,
+        ))
+
+    fig.update_layout(
+        barmode="stack", bargap=0.35,
+        title=dict(text=dim.title, x=0.5, xanchor="center",
+                   font=dict(size=16, family=FONT_FAMILY)),
+        height=GRAPH_HEIGHT, margin=dict(l=48, r=12, t=46, b=70),
+        showlegend=False, plot_bgcolor="white", paper_bgcolor="white",
+        font=dict(family=FONT_FAMILY, size=12, color=AXIS_COLOR),
+        annotations=annotations, uirevision=f"{folder}:{dim_key}",
+        xaxis=dict(tickmode="array", tickvals=xs, ticktext=tick_labels,
+                   range=[-0.5, MAX_BARS - 0.5], showgrid=False, zeroline=False,
+                   ticks="outside", ticklen=4, tickangle=0, automargin=True,
+                   color=AXIS_COLOR),
+        yaxis=dict(title=dict(text="Count", font=dict(size=12)),
+                   rangemode="tozero", showgrid=True, gridcolor=GRID_COLOR,
+                   zeroline=True, zerolinecolor=GRID_COLOR, ticks="outside",
+                   ticklen=4, automargin=True, color=AXIS_COLOR),
+    )
+    return fig
+
+
+def build_all_figures(domain: Domain, folder: str, folder_rows: pd.DataFrame,
+                      periods: List[Period],
+                      active_filter: Optional[Dict[str, Any]],
+                      presence: Dict[dt.date, Set[str]]) -> Dict[str, go.Figure]:
+    return {k: build_stacked_figure(folder, folder_rows, periods, k,
+                                    active_filter, domain.dimensions, presence)
+            for k in domain.dimension_order}
+
+
+def render_domain(domain: Domain, store: "DataStore", folder: Optional[str],
+                  mode: Optional[str], custom_dates: Optional[Sequence[str]],
+                  active_filter: Optional[Dict[str, Any]],
+                  today: Optional[dt.date] = None
+                  ) -> Tuple[List[go.Figure], str]:
+    """Pure render: decide periods, lazily read only the needed files, build the
+    figures + info string.  Shared by the Dash callback and the render self-check
+    so the exact code that populates the graphs is directly testable (this is what
+    guarantees the graphs are never stuck on the 'Loading...' placeholder).
+    """
+    order = domain.dimension_order
+    if today is None:
+        today = dt.date.today()
+
+    if not folder or folder == NO_FOLDERS_VALUE:
+        msg = (f"No folders under {os.path.abspath(store.root)} - "
+               "see the diagnostics above.")
+        return ([empty_figure(domain.dimensions[k].title, "No folders found")
+                 for k in order], msg)
+
+    dates = store.folder_dates(folder)
+    periods = build_periods(dates, mode or MODE_DAILY, today, custom_dates)
+
+    n_files = store.folder_file_count(folder)
+    if n_files == 0:
+        reason: Optional[str] = f"No workbooks found in folder '{folder}'."
+    elif not periods:
+        if mode == MODE_CUSTOM and not custom_dates:
+            reason = "Custom view: pick one or more dates above."
+        else:
+            reason = "Files found, but none are dated on/before today."
+    else:
+        reason = None
+
+    if reason is not None:
+        return ([empty_figure(domain.dimensions[k].title, reason)
+                 for k in order], reason)
+
+    needed: Set[dt.date] = set()
+    for p in periods:
+        needed.update(p.dates)
+    loaded = store.load_dates(folder, sorted(needed))
+
+    af = (active_filter if (active_filter
+                            and active_filter.get("folder") == folder) else None)
+    figures = build_all_figures(domain, folder, loaded.rows, periods, af,
+                                loaded.presence)
+    fig_list = [figures[k] for k in order]
+
+    mode_label = {MODE_DAILY: "daily", MODE_WEEKLY: "weekly",
+                  MODE_MONTHLY: "monthly", MODE_CUSTOM: "custom"}.get(mode, "daily")
+    info = f"{len(periods)} bar(s) - {mode_label} view"
+    if af:
+        rdim = domain.dimensions.get(af["dim"])
+        if rdim:
+            info += f"  |  filter: {rdim.title} = {af['value']}"
+    if loaded.errors:
+        info += f"  |  {len(loaded.errors)} file error(s)"
+    return fig_list, info
+
+
+# =========================================================================== #
+#  SECTION 11 - DASH LAYOUT                                                    #
+# =========================================================================== #
+
+NO_FOLDERS_VALUE = "__none__"
+
+
+def did(domain_key: str, name: str) -> str:
+    """Domain-scoped component id, e.g. 'test_case-folder-tabs'."""
+    return f"{domain_key}-{name}"
+
+
+def graph_id(domain_key: str, dim_key: str) -> str:
+    return f"{domain_key}-g-{dim_key}"
+
+
+# ---- inline styles --------------------------------------------------------- #
+STYLE_PAGE = {"fontFamily": FONT_FAMILY, "maxWidth": "1500px",
+              "margin": "0 auto", "padding": "12px 18px 40px 18px",
+              "color": "#222222"}
+STYLE_TOPBAR = {"display": "flex", "alignItems": "baseline",
+                "justifyContent": "space-between", "flexWrap": "wrap",
+                "gap": "10px", "borderBottom": "2px solid #ECECEC",
+                "paddingBottom": "8px", "marginBottom": "8px"}
+STYLE_SUBHEADER = {"display": "flex", "alignItems": "center",
+                   "justifyContent": "space-between", "flexWrap": "wrap",
+                   "gap": "10px", "margin": "8px 0 6px 0"}
+STYLE_BTN = {"border": "none", "borderRadius": "8px", "padding": "9px 16px",
+             "fontSize": "14px", "fontWeight": 600, "cursor": "pointer",
+             "color": "white", "backgroundColor": "#2563EB"}
+STYLE_BTN_SECONDARY = dict(STYLE_BTN); STYLE_BTN_SECONDARY.update({"backgroundColor": "#6B7280"})
+STYLE_CONTROLS = {"display": "flex", "alignItems": "center", "flexWrap": "wrap",
+                  "gap": "12px", "margin": "6px 0 12px 0", "padding": "10px 12px",
+                  "backgroundColor": "#F8FAFC", "border": "1px solid #E5E7EB",
+                  "borderRadius": "10px"}
+STYLE_CARD = {"border": "1px solid #E5E7EB", "borderRadius": "12px",
+              "padding": "6px 8px 4px 8px", "backgroundColor": "white",
+              "boxShadow": "0 1px 3px rgba(0,0,0,0.05)"}
+STYLE_GRID = {"display": "grid",
+              "gridTemplateColumns": "repeat(2, minmax(0, 1fr))",
+              "gap": "12px", "marginTop": "8px"}
+GRAPH_CONFIG = {"displayModeBar": False, "responsive": True, "doubleClick": "reset"}
+
+
+def build_tabs(folders: List[str], current: Optional[str]):
+    if not folders:
+        return ([dcc.Tab(label="(no folders found)", value=NO_FOLDERS_VALUE)],
+                NO_FOLDERS_VALUE)
+    children = [dcc.Tab(label=f, value=f, style={"padding": "8px 14px"},
+                        selected_style={"padding": "8px 14px", "fontWeight": 700,
+                                        "borderTop": "3px solid #2563EB"})
+                for f in folders]
+    value = current if current in folders else folders[0]
+    return children, value
+
+
+def graph_card(domain: Domain, dim_key: str):
+    dim = domain.dimensions[dim_key]
+    style = dict(STYLE_CARD)
+    if dim.full_width:
+        style["gridColumn"] = "1 / -1"
+    return html.Div(
+        dcc.Graph(id=graph_id(domain.key, dim_key), config=GRAPH_CONFIG,
+                  figure=empty_figure(dim.title, "Loading...")),
+        style=style,
+    )
+
+
+def build_domain_panel(domain: Domain, store: "DataStore"):
+    """Build one dashboard tab's full panel (self-contained, prefixed ids)."""
+    dk = domain.key
+    folders = store.folder_names()
+    tab_children, tab_value = build_tabs(folders, None)
+    return html.Div(children=[
+        html.Div(style=STYLE_SUBHEADER, children=[
+            html.Div(id=did(dk, "status-line"), children=store.summary(),
+                     style={"fontSize": "12px", "color": "#6B7280"}),
+            html.Button("Refresh data", id=did(dk, "refresh-btn"), n_clicks=0,
+                        style=STYLE_BTN),
+        ]),
+        dcc.Store(id=did(dk, "data-version"), data=0),
+        dcc.Store(id=did(dk, "active-filter"), data=None),
+        html.Div(id=did(dk, "error-line"),
+                 style={"fontSize": "12px", "color": "#B91C1C",
+                        "marginBottom": "6px", "whiteSpace": "pre-wrap"}),
+        dcc.Tabs(id=did(dk, "folder-tabs"), value=tab_value, children=tab_children,
+                 style={"marginBottom": "4px"}),
+        html.Div(style=STYLE_CONTROLS, children=[
+            html.Label("View:", style={"fontWeight": 600}),
+            dcc.Dropdown(id=did(dk, "mode-dd"), options=MODE_OPTIONS,
+                         value=MODE_DAILY, clearable=False,
+                         style={"width": "260px"}),
+            html.Label("Custom dates:", style={"fontWeight": 600}),
+            dcc.Dropdown(id=did(dk, "custom-dates"), options=[], value=[],
+                         multi=True, disabled=True,
+                         placeholder="Pick up to 10 dates (Custom view)",
+                         style={"minWidth": "320px", "flex": "1"}),
+            html.Button("Clear selection", id=did(dk, "clear-btn"), n_clicks=0,
+                        style=STYLE_BTN_SECONDARY),
+            html.Div(id=did(dk, "controls-info"),
+                     style={"fontSize": "12px", "color": "#374151",
+                            "marginLeft": "auto"}),
+        ]),
+        html.Div("Tip: click any coloured segment to cross-filter every graph "
+                 "for that day. Click it again (or press Clear selection) to reset.",
+                 style={"fontSize": "12px", "color": "#6B7280",
+                        "margin": "0 2px 4px"}),
+        html.Div(style=STYLE_GRID,
+                 children=[graph_card(domain, k) for k in domain.dimension_order]),
+    ])
+
+
+def serve_layout(domains: List[Domain], stores: Dict[str, "DataStore"]):
+    """Top-level layout: both panels always present, toggled by the domain tabs."""
+    panels = []
+    for i, d in enumerate(domains):
+        panels.append(html.Div(
+            id=did(d.key, "panel"),
+            style={"display": "block" if i == 0 else "none"},
+            children=build_domain_panel(d, stores[d.key]),
+        ))
+    return html.Div(style=STYLE_PAGE, children=[
+        html.Div(style=STYLE_TOPBAR, children=[
+            html.H2("RT Traceability Dashboard",
+                    style={"margin": "0", "fontSize": "22px"}),
+            html.Div("Requirements & Test Cases",
+                     style={"fontSize": "12px", "color": "#9CA3AF"}),
+        ]),
+        dcc.Store(id="_resize_kick"),
+        dcc.Tabs(id="domain-tabs", value=domains[0].key,
+                 children=[dcc.Tab(label=d.title, value=d.key,
+                                   style={"padding": "10px 18px", "fontWeight": 600},
+                                   selected_style={"padding": "10px 18px",
+                                                   "fontWeight": 800,
+                                                   "borderTop": "3px solid #0B6623"})
+                           for d in domains],
+                 style={"marginBottom": "6px"}),
+        html.Div(panels),
+        html.Div("RT Dashboard - reads workbooks on demand (scales to thousands "
+                 "of files). Use Refresh after adding new Excel files.",
+                 style={"fontSize": "11px", "color": "#9CA3AF",
+                        "marginTop": "18px", "textAlign": "center"}),
+    ])
+
+
+# =========================================================================== #
+#  SECTION 12 - DASH CALLBACKS                                                 #
+# =========================================================================== #
+
+def register_global_callbacks(app: "Dash", domains: List[Domain]) -> None:
+    """Top-level: toggle panel visibility + nudge Plotly to resize on switch."""
+
+    @app.callback(
+        [Output(did(d.key, "panel"), "style") for d in domains],
+        Input("domain-tabs", "value"),
+    )
+    def _toggle_panels(active):
+        return [{"display": "block"} if d.key == active else {"display": "none"}
+                for d in domains]
+
+    app.clientside_callback(
+        """
+        function(value) {
+            setTimeout(function(){ window.dispatchEvent(new Event('resize')); }, 60);
+            return value;
+        }
+        """,
+        Output("_resize_kick", "data"),
+        Input("domain-tabs", "value"),
+    )
+
+
+def register_domain_callbacks(app: "Dash", domain: Domain,
+                              store: "DataStore") -> None:
+    """Wire every interaction for one dashboard tab (all ids domain-prefixed)."""
+    dk = domain.key
+    dim_order = domain.dimension_order
+
+    # (1) Rebuild folder tabs + status + error whenever data-version changes.
+    @app.callback(
+        Output(did(dk, "folder-tabs"), "children"),
+        Output(did(dk, "folder-tabs"), "value"),
+        Output(did(dk, "status-line"), "children"),
+        Output(did(dk, "error-line"), "children"),
+        Input(did(dk, "data-version"), "data"),
+        State(did(dk, "folder-tabs"), "value"),
+    )
+    def _refresh_tabs(_version, current_value):
+        folders = store.folder_names()
+        children, value = build_tabs(folders, current_value)
+        if store.total_files() == 0:
+            err = ("No workbooks found for this dashboard.\n"
+                   "------------------------------------------------------------\n"
+                   + store.diagnostics(sample_reads=False)
+                   + "\n------------------------------------------------------------\n"
+                   f"Expected layout:  <root>/<Name>/<DD-MON-YY>.xlsx\n"
+                   f"Each file needs a 'Category' column including "
+                   f"{domain.target_label}.\n"
+                   "Point the app at your data with --root / --tc-root (or the "
+                   "RT_ROOT / TC_ROOT env vars), then press 'Refresh data'.")
+        else:
+            err = ""
+        return children, value, store.summary(), err
+
+    # (2) Refresh button -> rescan disk, bump version, clear filter.
+    @app.callback(
+        Output(did(dk, "data-version"), "data"),
+        Output(did(dk, "active-filter"), "data", allow_duplicate=True),
+        Input(did(dk, "refresh-btn"), "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def _do_refresh(n_clicks):
+        if not n_clicks:
+            raise PreventUpdate
+        log.info("[%s] manual refresh #%s", dk, n_clicks)
+        store.scan()
+        return int(n_clicks), None
+
+    # (3) Enable/disable the custom-date picker based on the mode.
+    @app.callback(
+        Output(did(dk, "custom-dates"), "disabled"),
+        Input(did(dk, "mode-dd"), "value"),
+    )
+    def _toggle_custom(mode):
+        return mode != MODE_CUSTOM
+
+    # (4) Populate custom-date options for the selected folder (cheap: no reads).
+    @app.callback(
+        Output(did(dk, "custom-dates"), "options"),
+        Input(did(dk, "folder-tabs"), "value"),
+        Input(did(dk, "data-version"), "data"),
+    )
+    def _custom_options(folder, _version):
+        dates = store.folder_dates(folder) if folder else []
+        recent = sorted(set(dates), reverse=True)[:CUSTOM_DATE_OPTION_CAP]
+        return [{"label": fmt_date(d), "value": fmt_date(d)} for d in recent]
+
+    # (5) Reset custom-date selection when the folder changes.
+    @app.callback(
+        Output(did(dk, "custom-dates"), "value"),
+        Input(did(dk, "folder-tabs"), "value"),
+        prevent_initial_call=True,
+    )
+    def _reset_custom(_folder):
+        return []
+
+    # (6) Cross-filter: clicks, Clear, folder switches.
+    @app.callback(
+        Output(did(dk, "active-filter"), "data"),
+        [Input(graph_id(dk, k), "clickData") for k in dim_order]
+        + [Input(did(dk, "clear-btn"), "n_clicks"),
+           Input(did(dk, "folder-tabs"), "value")],
+        State(did(dk, "active-filter"), "data"),
+        prevent_initial_call=True,
+    )
+    def _cross_filter(*args):
+        n_dims = len(dim_order)
+        click_payloads = args[:n_dims]
+        folder_value = args[n_dims + 1]
+        current = args[n_dims + 2]
+
+        trigger = ctx.triggered_id
+        if trigger in (did(dk, "folder-tabs"), did(dk, "clear-btn")):
+            return None
+
+        dim_key = None
+        payload = None
+        for key, cdata in zip(dim_order, click_payloads):
+            if trigger == graph_id(dk, key):
+                dim_key, payload = key, cdata
+                break
+        if dim_key is None or not payload:
+            raise PreventUpdate
+        try:
+            point = payload["points"][0]
+            period_key, _label, value = point["customdata"]
+        except (KeyError, IndexError, TypeError, ValueError):
+            raise PreventUpdate
+
+        candidate = {"folder": folder_value, "period_key": period_key,
+                     "dim": dim_key, "value": value}
+        return None if current == candidate else candidate
+
+    # (7) Main render -> all figures + info. Fires on load; never raises.
+    @app.callback(
+        [Output(graph_id(dk, k), "figure") for k in dim_order]
+        + [Output(did(dk, "controls-info"), "children")],
+        Input(did(dk, "folder-tabs"), "value"),
+        Input(did(dk, "mode-dd"), "value"),
+        Input(did(dk, "custom-dates"), "value"),
+        Input(did(dk, "active-filter"), "data"),
+        Input(did(dk, "data-version"), "data"),
+    )
+    def _render(folder, mode, custom_dates, active_filter, _version):
+        try:
+            fig_list, info = render_domain(domain, store, folder, mode,
+                                           custom_dates, active_filter)
+            return fig_list + [info]
+        except Exception as exc:  # never leave graphs stuck on 'Loading...'
+            log.exception("[%s] render failed", dk)
+            return ([empty_figure(domain.dimensions[k].title, "render error")
+                     for k in dim_order] + [f"Error: {exc}"])
+
+
+# =========================================================================== #
+#  SECTION 13 - DEMO DATA GENERATORS                                           #
+# =========================================================================== #
+
+def _demo_dates(today: dt.date) -> List[dt.date]:
+    """Recent dailies + a spread of older points for weekly/monthly views."""
+    offsets = list(range(0, 12)) + [16, 23, 30, 45, 60, 90, 120, 150]
+    return sorted({today - dt.timedelta(days=o) for o in offsets})
+
+
+# ---- Requirements demo ----------------------------------------------------- #
+_DEMO_CATEGORIES = ["Functional Requirement", "Non-Functional Requirement",
+                    "Functional Requirement", "Non-Functional Requirement",
+                    "Heading", "Information", "Functional Requirement"]
+_DEMO_STATUSES = ["created", "Specified", "accepted", "Created",
+                  "ACCEPTED", "draft", "in review", "specified"]
+_DEMO_ASIL = ["QM", "ABVQM", "A(QM)", "tbd", "TBD", "A", "B", "C", "D",
+              "A(B)", "D(QM)", "", "", "QM"]
+_DEMO_VALIDATORS = ["", "j.smith", "a.kumar", "", "team-x", "", "l.zhang"]
+
+
+def _demo_frame(rng, folder: str, d: dt.date) -> pd.DataFrame:
+    n = int(rng.integers(45, 95))
+    cal_pool = (["CAL1", "CAL2", "CAL3", "CAL4", ""] if folder.endswith("Alpha")
+                else ["1", "2", "3", "4", "5", "6", ""])
+    rows = []
+    for _ in range(n):
+        rows.append({
+            "ID": f"REQ-{int(rng.integers(1000, 9999))}",
+            "Category": _DEMO_CATEGORIES[int(rng.integers(0, len(_DEMO_CATEGORIES)))],
+            "status": _DEMO_STATUSES[int(rng.integers(0, len(_DEMO_STATUSES)))],
+            "Description": "auto-generated demo row",
+            "Validated By": _DEMO_VALIDATORS[int(rng.integers(0, len(_DEMO_VALIDATORS)))],
+            "CAL": cal_pool[int(rng.integers(0, len(cal_pool)))],
+            "ASIL": _DEMO_ASIL[int(rng.integers(0, len(_DEMO_ASIL)))],
+            "Validated By Pass Count": float(rng.choice([0, 0, 0.4, 0.85, 0.95, 1, 2, 5])),
+            "Validated By Fail Count": float(rng.choice([0, 0, 0, 0.5, 0.9, 1, 3])),
+            "Validated By Trace Count": float(rng.choice([0, 0, 0.7, 1, 2])),
+            "Comment": "",
+        })
+    return pd.DataFrame(rows)
+
+
+def generate_demo_data(root: str, seed: int = 42) -> None:
+    rng = np.random.default_rng(seed)
+    today = dt.date.today()
+    dates = _demo_dates(today)
+    for folder in ("Project_Alpha", "Project_Beta"):
+        fp = os.path.join(root, folder)
+        os.makedirs(fp, exist_ok=True)
+        for d in dates:
+            fname = fmt_date(d) + ".xlsx"
+            try:
+                _demo_frame(rng, folder, d).to_excel(
+                    os.path.join(fp, fname), index=False, engine="openpyxl")
+            except Exception as exc:  # pragma: no cover
+                log.warning("Could not write demo file: %s", exc)
+    log.info("Requirements demo written to %s", os.path.abspath(root))
+
+
+# ---- Test-Case demo -------------------------------------------------------- #
+_TC_CATEGORIES = ["Software Test Level 1", "Software Test Level 1",
+                  "Software Test Level 2", "Heading", "Software Test Level 1",
+                  "Software Test Level 1"]
+_TC_STATUSES = ["accepted", "created", "deleted", "N/A", "specified", "",
+                "Accepted", "Created"]
+_TC_RESULTS = ["Passed", "Failed", "Skipped", "Not run", "", "passed", "failed"]
+_TC_TYPES = ["Manual", "Automated", "manual", "automated", ""]
+_TC_ASIL = ["A", "B", "C", "D", "QM", "A(QM)", "ASIL A", "ASIL B", "ASIL C",
+            "ASIL D", "", "tbd"]
+_TC_CAL_A = ["CAL 1", "CAL 2", "CAL 3", "CAL 4", "CAL 5", "QM", "", ""]
+_TC_CAL_B = ["1", "2", "3", "4", "5", "6", "7", ""]
+_TC_REGRESSION = ["false", "pass", "", "true", "False", "Pass", "skip"]
+_TC_USERS = ["", "j.smith", "a.kumar", "", "team-x"]
+_TC_CRITERIA = ["", "criteria text", "", "some criteria", "x"]
+_TC_VALIDATED = ["", "yes", "", "validated", "x"]
+
+
+def _tc_demo_frame(rng, folder: str, d: dt.date) -> pd.DataFrame:
+    n = int(rng.integers(40, 90))
+    cal_pool = _TC_CAL_A if folder.endswith("X") else _TC_CAL_B
+    rows = []
+    for _ in range(n):
+        rows.append({
+            "ID": f"TC-{int(rng.integers(1000, 9999))}",
+            "Category": _TC_CATEGORIES[int(rng.integers(0, len(_TC_CATEGORIES)))],
+            "status": _TC_STATUSES[int(rng.integers(0, len(_TC_STATUSES)))],
+            "Last Result": _TC_RESULTS[int(rng.integers(0, len(_TC_RESULTS)))],
+            "Test Case Type": _TC_TYPES[int(rng.integers(0, len(_TC_TYPES)))],
+            "test criteria": _TC_CRITERIA[int(rng.integers(0, len(_TC_CRITERIA)))],
+            "Validated": _TC_VALIDATED[int(rng.integers(0, len(_TC_VALIDATED)))],
+            "Responsible User": _TC_USERS[int(rng.integers(0, len(_TC_USERS)))],
+            "ASIL": _TC_ASIL[int(rng.integers(0, len(_TC_ASIL)))],
+            "CAL": cal_pool[int(rng.integers(0, len(cal_pool)))],
+            "Regression Test": _TC_REGRESSION[int(rng.integers(0, len(_TC_REGRESSION)))],
+            "Comment": "",
+        })
+    return pd.DataFrame(rows)
+
+
+def generate_tc_demo_data(root: str, seed: int = 7) -> None:
+    rng = np.random.default_rng(seed)
+    today = dt.date.today()
+    dates = _demo_dates(today)
+    for folder in ("Module_X", "Module_Y"):
+        fp = os.path.join(root, folder)
+        os.makedirs(fp, exist_ok=True)
+        for i, d in enumerate(dates):
+            df = _tc_demo_frame(rng, folder, d)
+            # Demonstrate per-bar "no data": one file drops the ASIL column.
+            if folder == "Module_Y" and i == len(dates) - 2 and "ASIL" in df.columns:
+                df = df.drop(columns=["ASIL"])
+            try:
+                df.to_excel(os.path.join(fp, fmt_date(d) + ".xlsx"),
+                            index=False, engine="openpyxl")
+            except Exception as exc:  # pragma: no cover
+                log.warning("Could not write TC demo file: %s", exc)
+    log.info("Test-Case demo written to %s", os.path.abspath(root))
+
+
+def generate_bulk_demo(root: str, folder: str = "Bulk_Module",
+                       n_files: int = 1200, seed: int = 99) -> None:
+    """Write many dated workbooks to stress-test lazy loading (used by tests)."""
+    rng = np.random.default_rng(seed)
+    fp = os.path.join(root, folder)
+    os.makedirs(fp, exist_ok=True)
+    start = dt.date.today()
+    for i in range(n_files):
+        d = start - dt.timedelta(days=i)
+        _tc_demo_frame(rng, folder, d).to_excel(
+            os.path.join(fp, fmt_date(d) + ".xlsx"), index=False, engine="openpyxl")
+    log.info("Bulk demo: %d files in %s", n_files, os.path.abspath(fp))
+
+
+# =========================================================================== #
+#  SECTION 14 - SELF-TEST                                                      #
+# =========================================================================== #
+
+def _assert(cond: bool, msg: str, failures: List[str]) -> None:
+    if cond:
+        log.info("  PASS  %s", msg)
+    else:
+        log.error("  FAIL  %s", msg)
+        failures.append(msg)
+
+
+def _known_asil_frame() -> pd.DataFrame:
+    vals = ["QM", "ABVQM", "A(QM)", "tbd", "a", "b", "a(B)", "D(QM)", "", ""]
+    return pd.DataFrame({
+        "Category": ["Functional Requirement"] * len(vals),
+        "status": ["created"] * len(vals),
+        "Validated By": ["x"] * len(vals), "CAL": ["CAL1"] * len(vals),
+        "ASIL": vals, "Validated By Pass Count": [1] * len(vals),
+        "Validated By Fail Count": [0] * len(vals),
+        "Validated By Trace Count": [0] * len(vals),
+    })
+
+
+def _known_trace_frame() -> pd.DataFrame:
+    return pd.DataFrame({
+        "Category": ["Functional Requirement"] * 7, "status": ["created"] * 7,
+        "Validated By": ["", "x", "x", "x", "", "x", ""], "CAL": ["CAL1"] * 7,
+        "ASIL": ["A"] * 7,
+        "Validated By Pass Count": [1, 0.5, 0, 2, 0, 0, 0.95],
+        "Validated By Fail Count": [0, 0, 1, 0.95, 0, 0, 0],
+        "Validated By Trace Count": [0, 0, 0, 0, 1, 0, 0],
+    })
+
+
+def _tc_known_frame() -> pd.DataFrame:
+    cat = ["Software Test Level 1"] * 5 + ["Heading"]
+    return pd.DataFrame({
+        "Category": cat,
+        "status": ["accepted", "created", "deleted", "N/A", "specified", "x"],
+        "Last Result": ["Passed", "Failed", "Skipped", "Not run", "", "Passed"],
+        "Test Case Type": ["Manual", "Automated", "manual", "", "Automated", "x"],
+        "test criteria": ["set", "", "set", "", "", "x"],
+        "Validated": ["v", "v", "", "", "", "x"],
+        "Responsible User": ["a", "", "", "", "", "y"],
+        "ASIL": ["A", "B", "A", "C", "", "Z"],
+        "CAL": ["CAL1", "CAL2", "CAL1", "", "CAL3", "Z"],
+        "Regression Test": ["false", "pass", "", "Pass", "true", "x"],
+    })
+
+
+def run_selftest() -> int:
+    log.info("=" * 70)
+    log.info("RUNNING SELF-TEST")
+    log.info("=" * 70)
+    failures: List[str] = []
+    today = dt.date.today()
+
+    # --- Requirements: ASIL worked example -------------------------------- #
+    asil_rows, _ = process_workbook(_known_asil_frame(), "T", today, "a.xlsx")
+    ac = segment_counts(asil_rows, DIMENSIONS[DIM_ASIL])
+    _assert(ac.get("QM") == 4, f"REQ ASIL QM==4 (got {ac.get('QM')})", failures)
+    _assert(ac.get("tbd") == 1, f"REQ ASIL tbd==1 (got {ac.get('tbd')})", failures)
+    _assert(ac.get("blank") == 2, f"REQ ASIL blank==2 (got {ac.get('blank')})", failures)
+    _assert(ac.get("ASIL") == 3, f"REQ ASIL ASIL==3 (got {ac.get('ASIL')})", failures)
+
+    # --- Requirements: threshold + traceability --------------------------- #
+    tr, _ = process_workbook(_known_trace_frame(), "T", today, "t.xlsx")
+    got = list(tr["traceability_bucket"])
+    exp = ["Pass", "Not Tested", "Fail", "Fail", "Not Tested", "Not Tested", "Pass"]
+    _assert(got == exp, f"REQ traceability {got}=={exp}", failures)
+    _assert(float(tr.loc[1, "pass_count"]) == 0.0, "REQ 0.5 clamped to 0", failures)
+    _assert(float(tr.loc[3, "fail_count"]) == 0.95, "REQ 0.95 retained", failures)
+
+    # --- Requirements: existing traceability honoured --------------------- #
+    ex = _known_trace_frame(); ex["Traceability"] = ["Pass"] * 7
+    exr, _ = process_workbook(ex, "T", today, "e.xlsx")
+    _assert(set(exr["traceability_bucket"]) == {"Pass"},
+            "REQ existing Traceability used as-is", failures)
+
+    # --- Test-Case: row filter + each graph ------------------------------- #
+    tcr, present = process_test_case_workbook(_tc_known_frame(), "M", today, "m.xlsx")
+    _assert(len(tcr) == 5, f"TC keeps only STL1 rows (got {len(tcr)})", failures)
+    sc = segment_counts(tcr, TC_DIMENSIONS[TC_DIM_STATUS])
+    _assert(all(sc.get(k) == 1 for k in
+                ("accepted", "created", "deleted", "n/a", "specified")),
+            f"TC status one each (got {sc})", failures)
+    rc = segment_counts(tcr, TC_DIMENSIONS[TC_DIM_RESULT])
+    _assert(rc.get("Passed") == 1 and rc.get("Failed") == 1 and rc.get("blank") == 1,
+            f"TC result buckets (got {rc})", failures)
+    yc = segment_counts(tcr, TC_DIMENSIONS[TC_DIM_TYPE])
+    _assert(yc.get("Manual") == 2 and yc.get("Automated") == 2 and yc.get("blank") == 1,
+            f"TC type Manual==2,Automated==2,blank==1 (got {yc})", failures)
+    cc = segment_counts(tcr, TC_DIMENSIONS[TC_DIM_TESTCRIT])
+    _assert(cc.get("Set") == 2 and cc.get("Not Set") == 3,
+            f"TC criteria Set==2,NotSet==3 (got {cc})", failures)
+    vc = segment_counts(tcr, TC_DIMENSIONS[TC_DIM_VALUATION])
+    _assert(vc.get("Set") == 2 and vc.get("Not Set") == 3,
+            f"TC valuation Set==2,NotSet==3 (got {vc})", failures)
+    uc = segment_counts(tcr, TC_DIMENSIONS[TC_DIM_RESPONSIBLE])
+    _assert(uc.get("Set") == 1 and uc.get("Not Set") == 4,
+            f"TC responsible Set==1,NotSet==4 (got {uc})", failures)
+    gc = segment_counts(tcr, TC_DIMENSIONS[TC_DIM_REGRESSION])
+    _assert(gc.get("Pass") == 2 and gc.get("False") == 1 and gc.get("NIL") == 1
+            and gc.get("blank") == 1, f"TC regression (got {gc})", failures)
+    av, acol = resolve_dimension_values(TC_DIMENSIONS[TC_DIM_ASIL], tcr)
+    _assert("A" in av and len(acol) == len(av) and all(c in av for c in ("A", "B", "C")),
+            f"TC ASIL dynamic values (got {av})", failures)
+    cv, _ccol = resolve_dimension_values(TC_DIMENSIONS[TC_DIM_CAL], tcr)
+    _assert("CAL1" in cv and CAL_BLANK_LABEL in cv, f"TC CAL values (got {cv})", failures)
+    _assert(TC_CANON_ASIL in present and TC_CANON_TYPE in present,
+            "TC presence set includes ASIL & Test Case Type", failures)
+
+    # --- Test-Case: missing column -> that graph has no presence ---------- #
+    noasil = _tc_known_frame().drop(columns=["ASIL"])
+    _, present2 = process_test_case_workbook(noasil, "M", today, "m2.xlsx")
+    _assert(TC_CANON_ASIL not in present2 and TC_CANON_STATUS in present2,
+            "TC missing ASIL column reflected in presence", failures)
+    _assert(_bar_has_no_data(TC_DIMENSIONS[TC_DIM_ASIL], present2) is True,
+            "TC ASIL bar flagged no-data when column absent", failures)
+    _assert(_bar_has_no_data(TC_DIMENSIONS[TC_DIM_STATUS], present2) is False,
+            "TC Status bar NOT flagged when its column present", failures)
+
+    # --- Date parsing (DD-MON-YY and legacy) ------------------------------ #
+    _assert(parse_date_from_filename("26-OCT-26.xlsx") == dt.date(2026, 10, 26),
+            "parse 26-OCT-26", failures)
+    _assert(parse_date_from_filename("05-jan-26.xlsx") == dt.date(2026, 1, 5),
+            "parse 05-jan-26 (lowercase)", failures)
+    _assert(parse_date_from_filename("31-12-2025.xlsx") == dt.date(2025, 12, 31),
+            "parse legacy 31-12-2025", failures)
+    _assert(fmt_date(dt.date(2026, 10, 26)) == "26-OCT-26", "fmt 26-OCT-26", failures)
+
+    # --- Weekly (Sat else Fri) / Monthly (last day) ----------------------- #
+    sat = dt.date(2026, 10, 17)   # a Saturday
+    fri = dt.date(2026, 10, 16)   # the Friday before it
+    wk = build_weekly_periods([fri, sat, dt.date(2026, 10, 14)], dt.date(2026, 10, 20))
+    _assert(len(wk) == 1 and wk[0].dates == (sat,),
+            f"weekly picks Saturday (got {[fmt_date(x) for p in wk for x in p.dates]})",
+            failures)
+    wk2 = build_weekly_periods([fri, dt.date(2026, 10, 14)], dt.date(2026, 10, 20))
+    _assert(len(wk2) == 1 and wk2[0].dates == (fri,),
+            "weekly falls back to Friday when Saturday missing", failures)
+    wk3 = build_weekly_periods([dt.date(2026, 10, 13), dt.date(2026, 10, 14)],
+                               dt.date(2026, 10, 20))
+    _assert(len(wk3) == 0, "weekly skips week with neither Sat nor Fri", failures)
+    mdates = [dt.date(2026, 10, 3), dt.date(2026, 10, 20), dt.date(2026, 10, 28),
+              dt.date(2026, 9, 15)]
+    mo = build_monthly_periods(mdates, dt.date(2026, 10, 31))
+    oct_bar = [p for p in mo if p.dates[0].month == 10]
+    _assert(oct_bar and oct_bar[0].dates == (dt.date(2026, 10, 28),),
+            "monthly picks last day of month", failures)
+
+    # --- Figures build headlessly (both domains, incl. cross-filter) ------ #
+    daily = build_daily_periods([today - dt.timedelta(days=i) for i in range(5)], today)
+    pres = {p.dates[0]: set(TC_COLUMN_ALIASES.values()) for p in daily}
+    try:
+        tc_domain = build_domains("x", "y")[1]
+        figs = build_all_figures(tc_domain, "M", tcr, daily[:3], None,
+                                 {d: set(TC_COLUMN_ALIASES.values())
+                                  for p in daily[:3] for d in p.dates})
+        _assert(len(figs) == 9 and all(isinstance(f, go.Figure) for f in figs.values()),
+                "TC builds all 9 figures", failures)
+    except Exception as exc:
+        _assert(False, f"TC figure build raised: {exc}", failures)
+
+    log.info("=" * 70)
+    if failures:
+        log.error("SELF-TEST FAILED: %d assertion(s)", len(failures))
+        for f in failures:
+            log.error("   - %s", f)
+        return 1
+    log.info("SELF-TEST PASSED: all assertions green")
+    log.info("=" * 70)
+    return 0
+
+
+def _walk_component_ids(component, acc: List[str]) -> None:
+    """Collect every component id in a Dash layout tree (for a uniqueness audit)."""
+    cid = getattr(component, "id", None)
+    if isinstance(cid, str):
+        acc.append(cid)
+    children = getattr(component, "children", None)
+    if children is None:
+        return
+    if isinstance(children, (list, tuple)):
+        for ch in children:
+            if hasattr(ch, "children") or hasattr(ch, "id"):
+                _walk_component_ids(ch, acc)
+    elif hasattr(children, "children") or hasattr(children, "id"):
+        _walk_component_ids(children, acc)
+
+
+def _figure_bar_count(fig) -> int:
+    data = fig.get("data", []) if isinstance(fig, dict) else getattr(fig, "data", [])
+    total = 0
+    for tr in data:
+        t = tr.get("type") if isinstance(tr, dict) else getattr(tr, "type", "")
+        if t == "bar":
+            total += 1
+    return total
+
+
+def _figure_is_loading(fig) -> bool:
+    if isinstance(fig, dict):
+        anns = fig.get("layout", {}).get("annotations", []) or []
+        texts = [a.get("text", "") for a in anns]
+    else:
+        anns = list(getattr(fig.layout, "annotations", []) or [])
+        texts = [getattr(a, "text", "") for a in anns]
+    return "Loading..." in texts
+
+
+def run_render_check(req_root: str, tc_root: str) -> int:
+    """Headless proof the graphs populate (never stuck on 'Loading...').
+
+    Three independent checks:
+      1. The real Dash app builds and every component id is UNIQUE (duplicate ids
+         are the classic cause of a dead callback graph / stuck graphs).
+      2. Each domain's render callback is registered and outputs one figure per
+         graph (so every graph is actually wired).
+      3. The exact render logic (render_domain) returns real bar-bearing figures,
+         with none left on the 'Loading...' placeholder, for every view mode.
+    """
+    if not _DASH_AVAILABLE:
+        log.error("Dash not available; cannot run render check.")
+        return 1
+    log.info("=" * 70)
+    log.info("RUNNING RENDER CHECK (headless)")
+    log.info("=" * 70)
+    failures: List[str] = []
+    domains = build_domains(req_root, tc_root)
+    stores = {d.key: DataStore(d) for d in domains}
+    for s in stores.values():
+        s.scan()
+    app = create_app(domains, stores)
+
+    # (1) Unique component ids in the rendered layout.
+    ids: List[str] = []
+    _walk_component_ids(app.layout(), ids)
+    dupes = sorted({i for i in ids if ids.count(i) > 1})
+    _assert(not dupes, f"all component ids unique (dupes: {dupes})", failures)
+
+    # (2) Every graph is an output of some registered callback.
+    outputs = set()
+    for cid in app.callback_map.keys():
+        for part in cid.replace("[", "").replace("]", "").split("..."):
+            outputs.add(part.strip(" ."))   # Dash joins multi-outputs as ..a...b..
+    for d in domains:
+        for k in d.dimension_order:
+            want = graph_id(d.key, k) + ".figure"
+            _assert(want in outputs, f"[{d.key}] graph '{k}' is a callback output",
+                    failures)
+
+    # (3) render_domain yields populated figures for every mode.
+    for d in domains:
+        folders = stores[d.key].folder_names()
+        if not folders:
+            _assert(False, f"[{d.key}] no folders discovered (demo written?)", failures)
+            continue
+        folder = folders[0]
+        for mode in (MODE_DAILY, MODE_WEEKLY, MODE_MONTHLY):
+            try:
+                figs, _info = render_domain(d, stores[d.key], folder, mode, [], None)
+            except Exception as exc:
+                _assert(False, f"[{d.key}/{mode}] render raised: {exc}", failures)
+                continue
+            _assert(len(figs) == len(d.dimension_order),
+                    f"[{d.key}/{mode}] one figure per graph", failures)
+            bar_counts = [_figure_bar_count(f) for f in figs]
+            _assert(sum(bar_counts) > 0,
+                    f"[{d.key}/{mode}] figures contain bars (counts={bar_counts})",
+                    failures)
+            stuck = [k for k, f in zip(d.dimension_order, figs) if _figure_is_loading(f)]
+            _assert(not stuck, f"[{d.key}/{mode}] none stuck on Loading ({stuck})",
+                    failures)
+        # Custom mode with a real date populates too.
+        ds = stores[d.key].folder_dates(folder)
+        if ds:
+            figs, _ = render_domain(d, stores[d.key], folder, MODE_CUSTOM,
+                                    [fmt_date(ds[-1])], None)
+            _assert(sum(_figure_bar_count(f) for f in figs) > 0,
+                    f"[{d.key}/custom] figures contain bars", failures)
+        # Cross-filter path also builds without error.
+        try:
+            af = {"folder": folder, "period_key": "d:x",
+                  "dim": d.dimension_order[0], "value": "created"}
+            render_domain(d, stores[d.key], folder, MODE_DAILY, [], af)
+            _assert(True, f"[{d.key}] cross-filter render builds", failures)
+        except Exception as exc:
+            _assert(False, f"[{d.key}] cross-filter raised: {exc}", failures)
+
+    log.info("=" * 70)
+    if failures:
+        log.error("RENDER CHECK FAILED: %d issue(s)", len(failures))
+        for f in failures:
+            log.error("   - %s", f)
+        return 1
+    log.info("RENDER CHECK PASSED: graphs populate on load")
+    log.info("=" * 70)
+    return 0
+
+
+# =========================================================================== #
+#  SECTION 15 - APP FACTORY & CLI ENTRY-POINT                                  #
+# =========================================================================== #
+
+def _install_basic_auth(server) -> None:
+    from flask import request, Response
+    if not DASH_PASSWORD:
+        log.warning("RT_PASSWORD is blank - the dashboard is NOT locked.")
+        return
+    exp_user = DASH_USERNAME.encode("utf-8")
+    exp_pass = DASH_PASSWORD.encode("utf-8")
+
+    def _ok(u, p):
+        return (hmac.compare_digest((u or "").encode("utf-8"), exp_user)
+                and hmac.compare_digest((p or "").encode("utf-8"), exp_pass))
+
+    @server.before_request
+    def _require_login():
+        auth = request.authorization
+        if auth is None or not _ok(auth.username, auth.password):
+            return Response("Access denied. A username and password are required.",
+                            401, {"WWW-Authenticate": 'Basic realm="RT Dashboard"'})
+
+    log.info("Login protection ENABLED (username '%s').", DASH_USERNAME)
+
+
+def create_app(domains: List[Domain], stores: Dict[str, "DataStore"]) -> "Dash":
+    if not _DASH_AVAILABLE:
+        raise RuntimeError("Dash is not installed. Run:\n"
+                           "    pip install dash plotly pandas numpy openpyxl")
+    app = Dash(__name__, suppress_callback_exceptions=True, update_title=None)
+    app.title = "RT Traceability Dashboard"
+    app.layout = lambda: serve_layout(domains, stores)
+    register_global_callbacks(app, domains)
+    for d in domains:
+        register_domain_callbacks(app, d, stores[d.key])
+    _install_basic_auth(app.server)
+    return app
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="RT Requirements & Test-Case Traceability Dashboard",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument("--root", default=DEFAULT_RT_ROOT,
+                   help="Requirements root (one sub-folder per project).")
+    p.add_argument("--tc-root", default=DEFAULT_TC_ROOT,
+                   help="Test-Case root (one sub-folder per module).")
+    p.add_argument("--host", default="0.0.0.0", help="Host/interface to bind.")
+    p.add_argument("--port", default=8050, type=int, help="Port to serve on.")
+    p.add_argument("--demo", action="store_true",
+                   help="Generate sample data under both roots, then serve.")
+    p.add_argument("--selftest", action="store_true",
+                   help="Run internal logic assertions and exit.")
+    p.add_argument("--rendercheck", action="store_true",
+                   help="Headless proof that graphs render, then exit.")
+    p.add_argument("--debug", action="store_true", help="(ignored for serving)")
+    p.add_argument("--verbose", action="store_true", help="DEBUG logging.")
+    return p.parse_args(argv)
+
+
+def get_lan_ip() -> str:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = parse_args(argv)
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    if args.selftest:
+        return run_selftest()
+
+    req_root, tc_root = args.root, args.tc_root
+    if args.demo:
+        os.makedirs(req_root, exist_ok=True)
+        generate_demo_data(req_root)
+        os.makedirs(tc_root, exist_ok=True)
+        generate_tc_demo_data(tc_root)
+
+    if args.rendercheck:
+        return run_render_check(req_root, tc_root)
+
+    domains = build_domains(req_root, tc_root)
+    stores: Dict[str, DataStore] = {}
+    for d in domains:
+        if not os.path.isdir(d.root):
+            log.warning("[%s] root does not exist yet: %s",
+                        d.title, os.path.abspath(d.root))
+        s = DataStore(d)
+        s.scan()
+        stores[d.key] = s
+        log.info("[%s] diagnostics:\n%s", d.title, s.diagnostics())
+
+    app = create_app(domains, stores)
+    host, port, lan_ip = args.host, args.port, get_lan_ip()
+
+    if args.debug:
+        log.warning("--debug ignored for network serving (RCE risk on 0.0.0.0).")
+
+    log.info("=" * 70)
+    log.info("RT Dashboard listening on %s:%d", host, port)
+    log.info("  On this PC      :  http://127.0.0.1:%d", port)
+    log.info("  Share this link :  http://%s:%d", lan_ip, port)
+    if DASH_PASSWORD:
+        log.info("  Login required  :  username '%s'", DASH_USERNAME)
+    log.info("Press Ctrl+C to stop.")
+    log.info("=" * 70)
+
+    try:
+        from werkzeug.serving import run_simple
+    except Exception:
+        run_simple = None
+    if run_simple is not None:
+        run_simple(host, port, app.server, threaded=True,
+                   use_reloader=False, use_debugger=False)
+    else:  # pragma: no cover
+        run = getattr(app, "run", None) or getattr(app, "run_server")
+        run(host=host, port=port, debug=False)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+# ----------------------------------------------------------------------------
+# End of app.py
+# ----------------------------------------------------------------------------
