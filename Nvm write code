@@ -1,0 +1,1483 @@
+#!/usr/bin/env python3
+"""
+hex_length_filler.py
+====================
+
+Expand the 16-bit hex length field found in each Excel row into that many
+filled output columns. Works as a desktop GUI or as a command-line tool.
+
+Start
+-----
+    python hex_length_filler.py                    # GUI (also: double-click the file)
+    python hex_length_filler.py --gui input.xlsx   # GUI with the input pre-filled
+    python hex_length_filler.py input.xlsx [opts]  # command line, see --help
+
+Input
+-----
+The first worksheet of an .xlsx / .xlsm workbook (or the sheet you choose).
+Every row holds a hex byte sequence such as ``3D 03 10 2B``, either in one
+cell or spread across several cells. Only the LAST TWO bytes of the row are
+used. By default the first of them is the LSB and the second the MSB:
+
+    3D 03 10 2B   ->  LSB 0x10, MSB 0x2B  ->  0x2B10 = 11024 columns
+    ...   10 00   ->  0x0010 =    16 columns
+    ...   FF FF   ->  0xFFFF = 65535 columns
+
+Accepted byte spellings: ``10``, ``0x10``, single digits (``3`` -> 0x03) and
+run-together pairs (``3D03102B``). Bytes may be separated by spaces, commas,
+semicolons, colons, hyphens or pipes. Text that is not a hex byte is ignored
+unless it lands in the last two positions, so a label in an earlier column
+(e.g. a test-case ID) is harmless. If a comment column sits AFTER the bytes,
+restrict the input columns (GUI "Read columns" / CLI --columns).
+
+Output
+------
+Each output row gets ``length`` cells holding the fill value (default
+``0x00``). Output row N belongs to the N-th processed input row; empty or
+invalid input rows produce a blank output row so the alignment is kept. A
+"Report" sheet lists every input row with its decoded LSB/MSB, length, output
+location and status.
+
+Excel column limit
+------------------
+An .xlsx sheet holds at most 16,384 columns (A..XFD), so FF FF (65,535) cannot
+fit on one row of one sheet. Choose the behaviour (GUI "Long rows" / CLI
+--overflow):
+
+  split  (default)  Continue the SAME row number on extra sheets named
+                    "Bytes 1-16384", "Bytes 16385-32768", ... Row N on every
+                    data sheet still belongs to input row N.
+  wrap              Continue on the following rows of the same sheet.
+  error             Stop before writing anything.
+
+A .csv output has no column limit (one input row = one CSV row of the full
+length), but note that Excel only shows the first 16,384 columns of a CSV.
+
+Runs fully offline: no network access, no cloud services, no telemetry.
+Dependencies: openpyxl (pip install openpyxl); tkinter (bundled with the
+standard Windows/macOS Python installers) for the GUI.
+
+Exit codes (command line)
+-------------------------
+    0    success, every row converted
+    1    fatal error, nothing written
+    2    invalid command-line usage
+    3    output written, but one or more input rows were invalid
+    130  interrupted (Ctrl+C), nothing written
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime as _dt
+import logging
+import math
+import os
+import queue
+import re
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import zipfile
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+from typing import Any, Callable, Iterable, Optional, Sequence, Tuple
+
+try:
+    from openpyxl import Workbook, load_workbook
+    from openpyxl.cell import WriteOnlyCell
+    from openpyxl.styles import Font, PatternFill
+    from openpyxl.utils import column_index_from_string
+    from openpyxl.utils.exceptions import InvalidFileException
+
+    _OPENPYXL_IMPORT_ERROR: Optional[ImportError] = None
+except ImportError as _exc:  # pragma: no cover - environment dependent
+    _OPENPYXL_IMPORT_ERROR = _exc
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+    from tkinter import font as tkfont
+    from tkinter.scrolledtext import ScrolledText
+
+    _TK_IMPORT_ERROR: Optional[ImportError] = None
+except ImportError as _exc:  # pragma: no cover - environment dependent
+    tk = None  # type: ignore[assignment]
+    _TK_IMPORT_ERROR = _exc
+
+__version__ = "1.1.0"
+
+# --------------------------------------------------------------------------- #
+# Constants
+# --------------------------------------------------------------------------- #
+EXCEL_MAX_COLUMNS = 16_384          # A..XFD
+EXCEL_MAX_ROWS = 1_048_576
+MAX_SPLIT_SHEETS = 64               # guard against absurd --max-columns values
+LARGE_JOB_CELLS = 20_000_000        # warn above this many output cells
+PROGRESS_INTERVAL_S = 5.0
+MAX_ROW_WARNINGS = 20               # cap per-row warnings in the log
+
+INPUT_SUFFIXES = {".xlsx", ".xlsm", ".xltx", ".xltm"}
+OUTPUT_SUFFIXES = {".xlsx", ".csv"}
+
+EXIT_OK = 0
+EXIT_FATAL = 1
+EXIT_USAGE = 2
+EXIT_PARTIAL = 3
+EXIT_INTERRUPTED = 130
+
+LOG = logging.getLogger("hex_length_filler")
+LOG_FORMAT = "%(asctime)s %(levelname)-7s %(message)s"
+LOG_DATEFMT = "%H:%M:%S"
+
+
+# --------------------------------------------------------------------------- #
+# Types
+# --------------------------------------------------------------------------- #
+class FillerError(Exception):
+    """Fatal, user-facing error. The message is shown and nothing is written."""
+
+
+class OperationCancelled(FillerError):
+    """The user cancelled a running conversion."""
+
+
+class RowParseError(ValueError):
+    """A single input row could not be interpreted."""
+
+
+class Overflow(str, Enum):
+    SPLIT = "split"
+    WRAP = "wrap"
+    ERROR = "error"
+
+
+class ByteOrder(str, Enum):
+    LITTLE = "little"   # first of the two bytes is the LSB (default)
+    BIG = "big"         # first of the two bytes is the MSB
+
+
+class Status(str, Enum):
+    OK = "OK"
+    EMPTY = "EMPTY"
+    INVALID = "INVALID"
+
+
+# progress callback: (phase, done, total); phase is "read", "write" or "save"
+ProgressCallback = Callable[[str, int, int], None]
+
+
+@dataclass(frozen=True)
+class RowResult:
+    """Outcome of parsing one input row."""
+
+    input_row: int                 # 1-based Excel row number in the input
+    raw: str                       # row text as read (cells joined by spaces)
+    status: Status
+    length: int = 0
+    lsb: Optional[int] = None
+    msb: Optional[int] = None
+    message: str = ""
+
+
+@dataclass(frozen=True)
+class Plan:
+    """Validated output layout, computed before anything is written."""
+
+    sheet_titles: Tuple[str, ...]  # data sheets (xlsx only)
+    locations: Tuple[str, ...]     # one human-readable location per result
+    total_cells: int
+    longest: int
+
+
+@dataclass(frozen=True)
+class Config:
+    input_path: Path
+    output_path: Path
+    sheet: Optional[str] = None
+    first_col: Optional[int] = None
+    last_col: Optional[int] = None
+    skip_rows: int = 0
+    byte_order: ByteOrder = ByteOrder.LITTLE
+    fill: str = "0x00"
+    overflow: Overflow = Overflow.SPLIT
+    max_columns: int = EXCEL_MAX_COLUMNS
+    report: bool = True
+    strict: bool = False
+    force: bool = False
+
+    @property
+    def is_csv(self) -> bool:
+        return self.output_path.suffix.lower() == ".csv"
+
+    @property
+    def report_csv_path(self) -> Path:
+        return self.output_path.with_name(f"{self.output_path.stem}_report.csv")
+
+
+@dataclass(frozen=True)
+class RunSummary:
+    output_path: Path
+    report_path: Optional[Path]    # separate report file (CSV output only)
+    rows: int
+    ok: int
+    empty: int
+    invalid: int
+    total_cells: int
+    longest: int
+    data_sheets: int
+    elapsed_s: float
+
+    @property
+    def exit_code(self) -> int:
+        return EXIT_PARTIAL if self.invalid else EXIT_OK
+
+
+# --------------------------------------------------------------------------- #
+# Parsing
+# --------------------------------------------------------------------------- #
+_SPLIT_RE = re.compile(r"[\s,;:|\-]+")      # \s also covers non-breaking spaces
+_HEX_RE = re.compile(r"[0-9A-Fa-f]+")
+_DATE_TYPES = (_dt.date, _dt.time, _dt.timedelta)   # datetime is a date subclass
+
+
+def _strip_0x(token: str) -> str:
+    return token[2:] if token[:2].lower() == "0x" else token
+
+
+def cell_to_text(value: Any) -> str:
+    """Convert a cell value to the text the user typed.
+
+    Excel stores a cell typed as ``10`` as the number 10; its text "10" is
+    still read as the hex byte 0x10, which is what the user meant.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, _DATE_TYPES):
+        raise RowParseError(
+            f"cell contains a date/time ({value}); Excel converted the text - "
+            "format the input column as Text and re-enter the bytes"
+        )
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
+def tokenize(text: str) -> list[str]:
+    """Split row text into byte tokens.
+
+    Run-together hex such as ``3D03102B`` or ``0x102B`` is split into pairs.
+    Other pieces are kept verbatim and are only validated if they end up in
+    the last two positions.
+    """
+    tokens: list[str] = []
+    for piece in _SPLIT_RE.split(text):
+        if not piece:
+            continue
+        body = _strip_0x(piece)
+        if len(body) > 2 and len(body) % 2 == 0 and _HEX_RE.fullmatch(body):
+            tokens.extend(body[i:i + 2] for i in range(0, len(body), 2))
+        else:
+            tokens.append(piece)
+    return tokens
+
+
+def parse_byte(token: str) -> int:
+    """Parse one hex byte token (``2B``, ``0x2B``, ``b``) to an int 0..255."""
+    body = _strip_0x(token)
+    if not body or len(body) > 2 or not _HEX_RE.fullmatch(body):
+        raise RowParseError(f"'{token}' is not a valid hex byte (00..FF)")
+    return int(body, 16)
+
+
+def decode_length(tokens: Sequence[str],
+                  byte_order: ByteOrder = ByteOrder.LITTLE) -> Tuple[int, int, int]:
+    """Return ``(lsb, msb, length)`` from the last two tokens."""
+    if len(tokens) < 2:
+        raise RowParseError(f"need at least 2 bytes, found {len(tokens)}")
+    first, second = parse_byte(tokens[-2]), parse_byte(tokens[-1])
+    if byte_order is ByteOrder.LITTLE:
+        lsb, msb = first, second
+    else:
+        msb, lsb = first, second
+    return lsb, msb, (msb << 8) | lsb
+
+
+def parse_row(row_number: int, values: Iterable[Any],
+              byte_order: ByteOrder = ByteOrder.LITTLE) -> RowResult:
+    """Parse the cell values of one input row into a :class:`RowResult`."""
+    try:
+        texts = [cell_to_text(v) for v in values]
+    except RowParseError as exc:
+        return RowResult(row_number, "", Status.INVALID, message=str(exc))
+
+    raw = " ".join(t for t in texts if t)
+    if not raw:
+        return RowResult(row_number, raw, Status.EMPTY)
+    try:
+        lsb, msb, length = decode_length(tokenize(raw), byte_order)
+    except RowParseError as exc:
+        return RowResult(row_number, raw, Status.INVALID, message=str(exc))
+    return RowResult(row_number, raw, Status.OK, length=length, lsb=lsb, msb=msb)
+
+
+# --------------------------------------------------------------------------- #
+# Reading
+# --------------------------------------------------------------------------- #
+def _open_input_workbook(path: Path, read_only: bool):
+    if not path.is_file():
+        raise FillerError(f"Input file not found: {path}")
+    suffix = path.suffix.lower()
+    if suffix == ".xls":
+        raise FillerError("Legacy .xls is not supported; save the file as .xlsx in Excel first.")
+    if suffix not in INPUT_SUFFIXES:
+        raise FillerError(f"Unsupported input type '{path.suffix}'; expected one of "
+                          f"{', '.join(sorted(INPUT_SUFFIXES))}.")
+    try:
+        return load_workbook(path, read_only=read_only, data_only=True)
+    except PermissionError as exc:
+        raise FillerError(f"Permission denied reading '{path}'.") from exc
+    except (InvalidFileException, zipfile.BadZipFile, KeyError, OSError) as exc:
+        raise FillerError(f"Cannot read '{path}' as an Excel workbook: {exc}") from exc
+
+
+def list_sheet_names(path: Path) -> list[str]:
+    """Return the worksheet names of a workbook (fast, read-only)."""
+    wb = _open_input_workbook(path, read_only=True)
+    try:
+        return [ws.title for ws in wb.worksheets]
+    finally:
+        wb.close()
+
+
+def read_rows(cfg: Config) -> list[RowResult]:
+    """Read and parse every data row of the input sheet."""
+    wb = _open_input_workbook(cfg.input_path, read_only=False)
+    try:
+        if cfg.sheet is not None:
+            if cfg.sheet not in wb.sheetnames:
+                raise FillerError(f"Sheet '{cfg.sheet}' not found. Available: "
+                                  f"{', '.join(wb.sheetnames)}")
+            ws = wb[cfg.sheet]
+        else:
+            if not wb.worksheets:
+                raise FillerError(f"'{cfg.input_path}' contains no worksheets.")
+            ws = wb.worksheets[0]
+            if len(wb.worksheets) > 1:
+                LOG.warning("Workbook has %d sheets; using the first one, '%s' "
+                            "(choose another with --sheet).", len(wb.worksheets), ws.title)
+
+        start = cfg.skip_rows + 1
+        results: list[RowResult] = []
+        if ws.max_row >= start:
+            rows = ws.iter_rows(min_row=start, max_row=ws.max_row,
+                                min_col=cfg.first_col, max_col=cfg.last_col,
+                                values_only=True)
+            for row_number, values in enumerate(rows, start=start):
+                results.append(parse_row(row_number, values, cfg.byte_order))
+    finally:
+        wb.close()
+
+    # Excel often reports formatted-but-empty rows at the end; drop them.
+    while results and results[-1].status is Status.EMPTY:
+        results.pop()
+    return results
+
+
+# --------------------------------------------------------------------------- #
+# Planning (all limits are checked here, before any output is written)
+# --------------------------------------------------------------------------- #
+def _span(first: int, last: int) -> str:
+    return f"Row {first}" if first == last else f"Rows {first}-{last}"
+
+
+def plan_xlsx(results: Sequence[RowResult], max_columns: int, overflow: Overflow) -> Plan:
+    longest = max((r.length for r in results), default=0)
+    total = sum(r.length for r in results)
+
+    if longest > max_columns and overflow is Overflow.ERROR:
+        worst = next(r for r in results if r.length > max_columns)
+        raise FillerError(
+            f"Input row {worst.input_row} needs {worst.length} columns but a sheet row "
+            f"holds at most {max_columns}. Choose split or wrap for long rows, "
+            "or save as .csv."
+        )
+
+    locations: list[str] = []
+    if overflow is Overflow.WRAP or longest <= max_columns:
+        titles: Tuple[str, ...] = ("Output",)
+        next_row = 1
+        for r in results:
+            used = max(1, math.ceil(r.length / max_columns))
+            loc = _span(next_row, next_row + used - 1)
+            locations.append(loc + (" (blank)" if r.length == 0 else ""))
+            next_row += used
+        if next_row - 1 > EXCEL_MAX_ROWS:
+            raise FillerError(f"Wrapped output needs {next_row - 1:,} rows; Excel allows "
+                              f"{EXCEL_MAX_ROWS:,}. Use split for long rows or save as .csv.")
+    else:  # SPLIT across sheets, same row number on each
+        parts = math.ceil(longest / max_columns)
+        if parts > MAX_SPLIT_SHEETS:
+            raise FillerError(f"Split output would need {parts} sheets (limit "
+                              f"{MAX_SPLIT_SHEETS}). Increase the max columns per row "
+                              "or use wrap.")
+        titles = tuple(
+            f"Bytes {p * max_columns + 1}-{min((p + 1) * max_columns, longest)}"
+            for p in range(parts)
+        )
+        for n, r in enumerate(results, start=1):
+            used = math.ceil(r.length / max_columns)
+            if used == 0:
+                locations.append(f"Row {n} (blank)")
+            elif used == 1:
+                locations.append(f"Row {n}")
+            else:
+                locations.append(f"Row {n}, sheets 1-{used}")
+
+    return Plan(titles, tuple(locations), total, longest)
+
+
+def plan_csv(results: Sequence[RowResult]) -> Plan:
+    locations = tuple(f"Row {n}" + (" (blank)" if r.length == 0 else "")
+                      for n, r in enumerate(results, start=1))
+    return Plan((), locations,
+                sum(r.length for r in results),
+                max((r.length for r in results), default=0))
+
+
+# --------------------------------------------------------------------------- #
+# Writing
+# --------------------------------------------------------------------------- #
+class _Progress:
+    """Per-row progress: callback, cancellation check and periodic log line."""
+
+    def __init__(self, total: int, callback: Optional[ProgressCallback] = None,
+                 cancel: Optional[threading.Event] = None) -> None:
+        self.total = total
+        self.done = 0
+        self._callback = callback
+        self._cancel = cancel
+        self._last_log = time.monotonic()
+
+    def check_cancel(self) -> None:
+        if self._cancel is not None and self._cancel.is_set():
+            raise OperationCancelled("Cancelled by user; nothing written.")
+
+    def tick(self) -> None:
+        self.done += 1
+        self.check_cancel()
+        if self._callback is not None:
+            self._callback("write", self.done, self.total)
+        now = time.monotonic()
+        if now - self._last_log >= PROGRESS_INTERVAL_S:
+            LOG.info("  ... %d / %d rows written (%.0f%%)", self.done, self.total,
+                     100.0 * self.done / max(1, self.total))
+            self._last_log = now
+
+    def saving(self) -> None:
+        self.check_cancel()
+        LOG.info("Saving workbook (final compression step) ...")
+        if self._callback is not None:
+            self._callback("save", self.done, self.total)
+
+
+def _default_file_mode() -> int:
+    mask = os.umask(0)
+    os.umask(mask)
+    return 0o666 & ~mask
+
+
+def _atomic_write(target: Path, writer: Callable[[Path], None]) -> None:
+    """Write via a temp file in the target folder, then rename into place.
+
+    A crash, Ctrl+C or Cancel never leaves a half-written output file behind.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{target.stem}.", suffix=target.suffix,
+                                    dir=str(target.parent))
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        writer(tmp)
+        try:  # mkstemp creates 0600 files; give the output normal permissions
+            os.chmod(tmp, _default_file_mode())
+        except OSError:
+            pass
+        os.replace(tmp, target)
+    except PermissionError as exc:
+        raise FillerError(f"Cannot write '{target}': permission denied. If the file is "
+                          "open in Excel, close it and run again.") from exc
+    except OSError as exc:
+        raise FillerError(f"Cannot write '{target}': {exc}") from exc
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+REPORT_HEADERS = ("Input Row", "Input Data", "LSB", "MSB", "Length (dec)",
+                  "Length (hex)", "Output Location", "Status", "Message")
+REPORT_WIDTHS = (10, 36, 7, 7, 13, 13, 22, 10, 60)
+
+
+def _report_values(r: RowResult, location: str) -> list[Any]:
+    ok = r.status is Status.OK
+    return [
+        r.input_row,
+        r.raw,
+        f"0x{r.lsb:02X}" if ok else "",
+        f"0x{r.msb:02X}" if ok else "",
+        r.length if ok else "",
+        f"0x{r.length:04X}" if ok else "",
+        location,
+        r.status.value,
+        r.message,
+    ]
+
+
+def _write_report_sheet(wb: "Workbook", results: Sequence[RowResult], plan: Plan) -> None:
+    ws = wb.create_sheet("Report")
+    for idx, width in enumerate(REPORT_WIDTHS, start=1):
+        ws.column_dimensions[chr(64 + idx)].width = width
+    ws.freeze_panes = "A2"
+
+    bold = Font(bold=True)
+    header = []
+    for title in REPORT_HEADERS:
+        cell = WriteOnlyCell(ws, value=title)
+        cell.font = bold
+        header.append(cell)
+    ws.append(header)
+
+    invalid_fill = PatternFill("solid", fgColor="FFC7CE")
+    for r, loc in zip(results, plan.locations):
+        row = []
+        for value in _report_values(r, loc):
+            cell = WriteOnlyCell(ws, value=value)
+            if isinstance(value, str):
+                cell.data_type = "s"           # never interpret input text as a formula
+            if r.status is Status.INVALID:
+                cell.fill = invalid_fill
+            row.append(cell)
+        ws.append(row)
+
+
+def write_xlsx(results: Sequence[RowResult], plan: Plan, cfg: Config,
+               progress: _Progress) -> None:
+    def _writer(tmp: Path) -> None:
+        wb = Workbook(write_only=True)        # streams rows; constant memory
+        sheets = [wb.create_sheet(title) for title in plan.sheet_titles]
+        step = cfg.max_columns
+        single_sheet = len(sheets) == 1
+
+        for r in results:
+            if single_sheet:
+                ws = sheets[0]
+                if r.length == 0:
+                    ws.append([])             # keep row alignment
+                for start in range(0, r.length, step):
+                    ws.append([cfg.fill] * min(step, r.length - start))
+            else:                             # split: same row on every sheet
+                for part, ws in enumerate(sheets):
+                    count = min(step, r.length - part * step)
+                    ws.append([cfg.fill] * count if count > 0 else [])
+            progress.tick()
+
+        if cfg.report:
+            _write_report_sheet(wb, results, plan)
+        progress.saving()
+        wb.save(str(tmp))
+
+    _atomic_write(cfg.output_path, _writer)
+
+
+def write_csv(results: Sequence[RowResult], plan: Plan, cfg: Config,
+              progress: _Progress) -> None:
+    def _data_writer(tmp: Path) -> None:
+        with open(tmp, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            for r in results:
+                writer.writerow([cfg.fill] * r.length)
+                progress.tick()
+
+    def _report_writer(tmp: Path) -> None:
+        with open(tmp, "w", newline="", encoding="utf-8-sig") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(REPORT_HEADERS)
+            for r, loc in zip(results, plan.locations):
+                writer.writerow(_report_values(r, loc))
+
+    _atomic_write(cfg.output_path, _data_writer)
+    if cfg.report:
+        _atomic_write(cfg.report_csv_path, _report_writer)
+
+
+# --------------------------------------------------------------------------- #
+# Orchestration
+# --------------------------------------------------------------------------- #
+def _shorten(text: str, limit: int = 60) -> str:
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
+def output_targets(cfg: Config) -> list[Path]:
+    """Every file a run with this config will create or replace."""
+    return [cfg.output_path] + ([cfg.report_csv_path] if cfg.is_csv and cfg.report else [])
+
+
+def _check_output_paths(cfg: Config) -> None:
+    out = cfg.output_path
+    if out.suffix.lower() not in OUTPUT_SUFFIXES:
+        raise FillerError(f"Output must end in .xlsx or .csv (got '{out.name}').")
+    for target in output_targets(cfg):
+        if target.resolve() == cfg.input_path.resolve():
+            raise FillerError("Output path is the input file; refusing to overwrite it.")
+        if target.is_dir():
+            raise FillerError(f"'{target}' is a directory.")
+        if target.exists() and not cfg.force:
+            raise FillerError(f"'{target}' already exists. Use --force to overwrite.")
+
+
+def run(cfg: Config, progress_cb: Optional[ProgressCallback] = None,
+        cancel: Optional[threading.Event] = None) -> RunSummary:
+    """Execute one conversion.
+
+    Raises FillerError (or its subclass OperationCancelled) on fatal errors;
+    in every such case nothing is written.
+    """
+    t0 = time.monotonic()
+    if not cfg.fill:
+        raise FillerError("The fill value must not be empty.")
+    if cfg.fill.startswith("="):
+        raise FillerError("The fill value must not start with '=' (Excel would treat it "
+                          "as a formula).")
+    _check_output_paths(cfg)
+
+    if progress_cb is not None:
+        progress_cb("read", 0, 0)
+    LOG.info("Reading %s", cfg.input_path)
+    results = read_rows(cfg)
+    if not results:
+        raise FillerError("No data rows found in the input sheet.")
+
+    ok = sum(r.status is Status.OK for r in results)
+    empty = sum(r.status is Status.EMPTY for r in results)
+    invalid = [r for r in results if r.status is Status.INVALID]
+
+    for r in invalid[:MAX_ROW_WARNINGS]:
+        LOG.warning("Input row %d invalid: %s  [data: '%s']", r.input_row, r.message,
+                    _shorten(r.raw))
+    if len(invalid) > MAX_ROW_WARNINGS:
+        LOG.warning("... and %d more invalid rows (see the report).",
+                    len(invalid) - MAX_ROW_WARNINGS)
+    if invalid and cfg.strict:
+        raise FillerError(f"{len(invalid)} invalid row(s) and strict mode is on; "
+                          "nothing written.")
+
+    plan = plan_csv(results) if cfg.is_csv else plan_xlsx(results, cfg.max_columns, cfg.overflow)
+
+    LOG.info("Rows: %d total, %d OK, %d empty, %d invalid. Longest row: %d columns. "
+             "Cells to write: %s", len(results), ok, empty, len(invalid), plan.longest,
+             f"{plan.total_cells:,}")
+    if len(plan.sheet_titles) > 1:
+        LOG.info("Rows longer than %d columns continue on the same row of %d sheets: %s",
+                 cfg.max_columns, len(plan.sheet_titles), ", ".join(plan.sheet_titles))
+    if cfg.is_csv and plan.longest > EXCEL_MAX_COLUMNS:
+        LOG.warning("CSV rows up to %d columns: Excel will display only the first %d.",
+                    plan.longest, EXCEL_MAX_COLUMNS)
+    if plan.total_cells > LARGE_JOB_CELLS:
+        LOG.warning("Large job (%s cells): this can take several minutes and produce a "
+                    "large file.", f"{plan.total_cells:,}")
+
+    progress = _Progress(len(results), progress_cb, cancel)
+    progress.check_cancel()
+    LOG.info("Writing %s", cfg.output_path)
+    if cfg.is_csv:
+        write_csv(results, plan, cfg, progress)
+    else:
+        write_xlsx(results, plan, cfg, progress)
+
+    summary = RunSummary(
+        output_path=cfg.output_path,
+        report_path=cfg.report_csv_path if cfg.is_csv and cfg.report else None,
+        rows=len(results), ok=ok, empty=empty, invalid=len(invalid),
+        total_cells=plan.total_cells, longest=plan.longest,
+        data_sheets=len(plan.sheet_titles), elapsed_s=time.monotonic() - t0,
+    )
+    LOG.info("Done in %.1f s -> %s", summary.elapsed_s, cfg.output_path)
+    if summary.report_path is not None:
+        LOG.info("Report -> %s", summary.report_path)
+    return summary
+
+
+# --------------------------------------------------------------------------- #
+# GUI
+# --------------------------------------------------------------------------- #
+GUI_POLL_MS = 100
+
+OVERFLOW_LABELS = {
+    Overflow.SPLIT: "Split: same row continues on extra sheets",
+    Overflow.WRAP: "Wrap: continue on the following rows",
+    Overflow.ERROR: "Stop with an error",
+}
+_LABEL_TO_OVERFLOW = {label: mode for mode, label in OVERFLOW_LABELS.items()}
+
+
+class _QueueLogHandler(logging.Handler):
+    """Forwards log records from any thread to the GUI queue."""
+
+    def __init__(self, target: "queue.Queue[tuple]") -> None:
+        super().__init__()
+        self._target = target
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self._target.put(("log", record.levelno, self.format(record)))
+        except Exception:  # pragma: no cover
+            self.handleError(record)
+
+
+def _open_in_os(path: Path, reveal: bool = False) -> None:
+    """Open a file, or show it in the file manager, using local OS commands only."""
+    if sys.platform.startswith("win"):
+        if reveal:
+            subprocess.Popen(["explorer", f"/select,{path}"])
+        else:
+            os.startfile(str(path))  # type: ignore[attr-defined]
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", "-R", str(path)] if reveal else ["open", str(path)])
+    else:
+        subprocess.Popen(["xdg-open", str(path.parent if reveal else path)])
+
+
+def _enable_windows_dpi_awareness() -> None:
+    """Sharp text on scaled Windows displays (no effect elsewhere)."""
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+
+def _clean_path(text: str) -> Optional[Path]:
+    """Path from an entry; tolerates the quotes added by Windows 'Copy as path'."""
+    text = text.strip().strip('"').strip("'").strip()
+    return Path(text).expanduser() if text else None
+
+
+def _same_path(a: Optional[Path], b: Optional[Path]) -> bool:
+    if a is None or b is None:
+        return False
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return a == b
+
+
+class FillerApp:
+    """Tkinter front end.
+
+    Widgets are touched only on the Tk main thread. The conversion runs in a
+    worker thread that communicates exclusively through ``self.queue``.
+    """
+
+    def __init__(self, root: "tk.Tk", initial_input: Optional[Path] = None,
+                 initial_output: Optional[Path] = None) -> None:
+        self.root = root
+        self.queue: "queue.Queue[tuple]" = queue.Queue()
+        self.cancel_event = threading.Event()
+        self.worker: Optional[threading.Thread] = None
+        self.last_summary: Optional[RunSummary] = None
+        self._confirmed_output: Optional[Path] = None   # overwrite already confirmed
+        self._auto_output: Optional[str] = None         # output we suggested
+        self._loaded_input: Optional[Path] = None
+        self._closing = False
+        self._destroyed = False
+        self._inputs: list = []
+
+        root.title(f"Hex Length Filler {__version__}")
+        root.minsize(700, 620)
+        self._init_style()
+        self._init_vars()
+        self._build()
+
+        self.log_handler = _QueueLogHandler(self.queue)
+        self.log_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT))
+        LOG.handlers[:] = [self.log_handler]
+        LOG.setLevel(logging.INFO)
+        LOG.propagate = False
+
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
+        if initial_input is not None:
+            self.var_input.set(str(initial_input))
+            self._on_input_changed()
+        if initial_output is not None:
+            self.var_output.set(str(initial_output))
+            self._auto_output = None
+        self.root.after(GUI_POLL_MS, self._poll_queue)
+
+    # ----------------------------------------------------------------- setup
+    def _init_style(self) -> None:
+        style = ttk.Style(self.root)
+        if not sys.platform.startswith(("win", "darwin")) and "clam" in style.theme_names():
+            style.theme_use("clam")
+        self._bold = tkfont.nametofont("TkDefaultFont").copy()
+        self._bold.configure(weight="bold")
+        style.configure("Run.TButton", font=self._bold, padding=(14, 4))
+        style.configure("Hint.TLabel", foreground="#666666")
+        style.configure("Status.TLabel", padding=(8, 3))
+
+    def _init_vars(self) -> None:
+        self.var_input = tk.StringVar()
+        self.var_sheet = tk.StringVar()
+        self.var_output = tk.StringVar()
+        self.var_byte_order = tk.StringVar(value=ByteOrder.LITTLE.value)
+        self.var_fill = tk.StringVar(value="0x00")
+        self.var_skip = tk.StringVar(value="0")
+        self.var_columns = tk.StringVar()
+        self.var_overflow = tk.StringVar(value=OVERFLOW_LABELS[Overflow.SPLIT])
+        self.var_max_cols = tk.StringVar(value=str(EXCEL_MAX_COLUMNS))
+        self.var_report = tk.BooleanVar(value=True)
+        self.var_strict = tk.BooleanVar(value=False)
+        self.var_progress = tk.StringVar(value="")
+        self.var_status = tk.StringVar(value="Select an input workbook to start.")
+
+    def _build(self) -> None:
+        root = self.root
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(0, weight=1)
+        main = ttk.Frame(root, padding=10)
+        main.grid(row=0, column=0, sticky="nsew")
+        main.columnconfigure(0, weight=1)
+        main.rowconfigure(4, weight=1)
+        pad = {"pady": 3}
+
+        # Files ------------------------------------------------------------
+        files = ttk.LabelFrame(main, text="Files", padding=8)
+        files.grid(row=0, column=0, sticky="ew")
+        files.columnconfigure(1, weight=1)
+
+        ttk.Label(files, text="Input Excel:").grid(row=0, column=0, sticky="w", padx=(0, 8), **pad)
+        self.ent_input = ttk.Entry(files, textvariable=self.var_input)
+        self.ent_input.grid(row=0, column=1, sticky="ew", **pad)
+        self.ent_input.bind("<FocusOut>", lambda _e: self._on_input_changed())
+        self.ent_input.bind("<Return>", lambda _e: self._on_input_changed())
+        btn_in = ttk.Button(files, text="Browse…", command=self._browse_input)
+        btn_in.grid(row=0, column=2, padx=(8, 0), **pad)
+
+        ttk.Label(files, text="Sheet:").grid(row=1, column=0, sticky="w", padx=(0, 8), **pad)
+        self.cmb_sheet = ttk.Combobox(files, textvariable=self.var_sheet, state="readonly",
+                                      width=34)
+        self.cmb_sheet.grid(row=1, column=1, sticky="w", **pad)
+
+        ttk.Label(files, text="Output file:").grid(row=2, column=0, sticky="w", padx=(0, 8), **pad)
+        self.ent_output = ttk.Entry(files, textvariable=self.var_output)
+        self.ent_output.grid(row=2, column=1, sticky="ew", **pad)
+        btn_out = ttk.Button(files, text="Browse…", command=self._browse_output)
+        btn_out.grid(row=2, column=2, padx=(8, 0), **pad)
+        ttk.Label(files, style="Hint.TLabel",
+                  text="Save as .xlsx, or .csv to keep rows longer than 16,384 "
+                       "columns on one line.").grid(row=3, column=1, columnspan=2, sticky="w")
+
+        # Options ----------------------------------------------------------
+        opts = ttk.LabelFrame(main, text="Options", padding=8)
+        opts.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        opts.columnconfigure(3, weight=1)
+
+        ttk.Label(opts, text="Length bytes:").grid(row=0, column=0, sticky="w", padx=(0, 8), **pad)
+        order = ttk.Frame(opts)
+        order.grid(row=0, column=1, columnspan=3, sticky="w", **pad)
+        rb_le = ttk.Radiobutton(order, text="LSB first  (10 2B → 0x2B10)",
+                                variable=self.var_byte_order, value=ByteOrder.LITTLE.value)
+        rb_be = ttk.Radiobutton(order, text="MSB first  (10 2B → 0x102B)",
+                                variable=self.var_byte_order, value=ByteOrder.BIG.value)
+        rb_le.pack(side="left")
+        rb_be.pack(side="left", padx=(16, 0))
+
+        ttk.Label(opts, text="Fill value:").grid(row=1, column=0, sticky="w", padx=(0, 8), **pad)
+        ent_fill = ttk.Entry(opts, textvariable=self.var_fill, width=12)
+        ent_fill.grid(row=1, column=1, sticky="w", **pad)
+        ttk.Label(opts, text="Skip header rows:").grid(row=1, column=2, sticky="e",
+                                                       padx=(24, 8), **pad)
+        spn_skip = ttk.Spinbox(opts, textvariable=self.var_skip, from_=0, to=1_000_000,
+                               width=8)
+        spn_skip.grid(row=1, column=3, sticky="w", **pad)
+
+        ttk.Label(opts, text="Read columns:").grid(row=2, column=0, sticky="w", padx=(0, 8), **pad)
+        ent_cols = ttk.Entry(opts, textvariable=self.var_columns, width=12)
+        ent_cols.grid(row=2, column=1, sticky="w", **pad)
+        ttk.Label(opts, style="Hint.TLabel", text="Blank = whole row, or e.g.  B  or  B:E"
+                  ).grid(row=2, column=2, columnspan=2, sticky="w", padx=(24, 0), **pad)
+
+        ttk.Label(opts, text="Long rows:").grid(row=3, column=0, sticky="w", padx=(0, 8), **pad)
+        cmb_over = ttk.Combobox(opts, textvariable=self.var_overflow, state="readonly",
+                                values=list(OVERFLOW_LABELS.values()), width=42)
+        cmb_over.grid(row=3, column=1, columnspan=3, sticky="w", **pad)
+
+        ttk.Label(opts, text="Max columns/row:").grid(row=4, column=0, sticky="w", padx=(0, 8), **pad)
+        spn_max = ttk.Spinbox(opts, textvariable=self.var_max_cols, from_=1,
+                              to=EXCEL_MAX_COLUMNS, width=8)
+        spn_max.grid(row=4, column=1, sticky="w", **pad)
+        ttk.Label(opts, style="Hint.TLabel", text=f"{EXCEL_MAX_COLUMNS:,} = Excel limit"
+                  ).grid(row=4, column=2, columnspan=2, sticky="w", padx=(24, 0), **pad)
+
+        checks = ttk.Frame(opts)
+        checks.grid(row=5, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        chk_report = ttk.Checkbutton(checks, text="Write Report sheet",
+                                     variable=self.var_report)
+        chk_strict = ttk.Checkbutton(checks, text="Strict: write nothing if any row is invalid",
+                                     variable=self.var_strict)
+        chk_report.pack(side="left")
+        chk_strict.pack(side="left", padx=(24, 0))
+
+        # Buttons ----------------------------------------------------------
+        bar = ttk.Frame(main)
+        bar.grid(row=2, column=0, sticky="ew", pady=(12, 6))
+        self.btn_run = ttk.Button(bar, text="Run", style="Run.TButton", command=self._start)
+        self.btn_cancel = ttk.Button(bar, text="Cancel", command=self._cancel)
+        self.btn_open = ttk.Button(bar, text="Open output", command=self._open_output)
+        self.btn_folder = ttk.Button(bar, text="Show in folder", command=self._open_folder)
+        self.btn_run.pack(side="left")
+        self.btn_cancel.pack(side="left", padx=(8, 0))
+        self.btn_folder.pack(side="right")
+        self.btn_open.pack(side="right", padx=(0, 8))
+        for btn in (self.btn_cancel, self.btn_open, self.btn_folder):
+            btn.state(["disabled"])
+
+        # Progress ---------------------------------------------------------
+        prog = ttk.Frame(main)
+        prog.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        prog.columnconfigure(0, weight=1)
+        self.progress = ttk.Progressbar(prog, mode="determinate", maximum=100)
+        self.progress.grid(row=0, column=0, sticky="ew")
+        ttk.Label(prog, textvariable=self.var_progress, width=26, anchor="e"
+                  ).grid(row=0, column=1, padx=(8, 0))
+
+        # Log --------------------------------------------------------------
+        logf = ttk.LabelFrame(main, text="Log", padding=(6, 4))
+        logf.grid(row=4, column=0, sticky="nsew")
+        logf.columnconfigure(0, weight=1)
+        logf.rowconfigure(0, weight=1)
+        self.txt_log = ScrolledText(logf, height=10, wrap="word", state="disabled",
+                                    font="TkFixedFont", relief="flat", borderwidth=0)
+        self.txt_log.grid(row=0, column=0, sticky="nsew")
+        self.txt_log.tag_configure("warn", foreground="#9A5B00")
+        self.txt_log.tag_configure("error", foreground="#C62828")
+        self.txt_log.tag_configure("ok", foreground="#2E7D32")
+
+        ttk.Label(root, textvariable=self.var_status, style="Status.TLabel",
+                  relief="sunken", anchor="w").grid(row=1, column=0, sticky="ew")
+
+        self._inputs = [self.ent_input, btn_in, self.cmb_sheet, self.ent_output, btn_out,
+                        rb_le, rb_be, ent_fill, spn_skip, ent_cols, cmb_over, spn_max,
+                        chk_report, chk_strict]
+
+    # ------------------------------------------------------------ file pick
+    def _start_dir(self) -> str:
+        for text in (self.var_input.get(), self.var_output.get()):
+            path = _clean_path(text)
+            if path is not None and path.parent.is_dir():
+                return str(path.parent)
+        return str(Path.home())
+
+    def _browse_input(self) -> None:
+        chosen = filedialog.askopenfilename(
+            parent=self.root, title="Select input Excel workbook",
+            initialdir=self._start_dir(),
+            filetypes=[("Excel workbooks", "*.xlsx *.xlsm *.xltx *.xltm"),
+                       ("All files", "*.*")])
+        if chosen:
+            self.var_input.set(chosen)
+            self._on_input_changed()
+
+    def _browse_output(self) -> None:
+        current = _clean_path(self.var_output.get())
+        chosen = filedialog.asksaveasfilename(
+            parent=self.root, title="Save output as",
+            initialdir=str(current.parent) if current and current.parent.is_dir()
+            else self._start_dir(),
+            initialfile=current.name if current else "",
+            defaultextension=".xlsx",
+            filetypes=[("Excel workbook", "*.xlsx"),
+                       ("CSV - no column limit", "*.csv")])
+        if chosen:
+            self.var_output.set(chosen)
+            self._confirmed_output = Path(chosen)   # the dialog asked about overwriting
+            self._auto_output = None
+
+    def _on_input_changed(self) -> None:
+        if self.worker is not None and self.worker.is_alive():
+            return
+        path = _clean_path(self.var_input.get())
+        if path is None or _same_path(path, self._loaded_input):
+            return
+        self._loaded_input = None
+        self.cmb_sheet["values"] = ()
+        self.var_sheet.set("")
+        if not path.is_file():
+            self.var_status.set(f"Input not found: {path}")
+            return
+        try:
+            names = list_sheet_names(path)
+        except FillerError as exc:
+            self.var_status.set(str(exc))
+            return
+        if not names:
+            self.var_status.set(f"{path.name} contains no worksheets.")
+            return
+        self._loaded_input = path
+        self.cmb_sheet["values"] = names
+        self.var_sheet.set(names[0])
+
+        current = self.var_output.get().strip()
+        if not current or current == self._auto_output:
+            suggestion = str(path.with_name(f"{path.stem}_filled.xlsx"))
+            self.var_output.set(suggestion)
+            self._auto_output = suggestion
+        hint = "" if len(names) == 1 else "  Choose the sheet to read."
+        self.var_status.set(f"Loaded {path.name}: {len(names)} sheet(s).{hint}")
+
+    # ------------------------------------------------------------ validation
+    def _invalid(self, message: str, widget: Any) -> None:
+        messagebox.showerror("Check the settings", message, parent=self.root)
+        widget.focus_set()
+
+    def _collect_config(self) -> Optional[Config]:
+        """Validate the form; returns None (after telling the user) if invalid."""
+        self._on_input_changed()
+        inp = _clean_path(self.var_input.get())
+        if inp is None or not inp.is_file():
+            self._invalid("Select an existing input Excel workbook.", self.ent_input)
+            return None
+
+        out = _clean_path(self.var_output.get())
+        if out is None:
+            self._invalid("Choose where to save the output.", self.ent_output)
+            return None
+        if not out.suffix:
+            out = out.with_suffix(".xlsx")
+        if out.suffix.lower() not in OUTPUT_SUFFIXES:
+            self._invalid("The output file must end in .xlsx or .csv.", self.ent_output)
+            return None
+        if not out.is_absolute():
+            out = inp.parent / out              # relative names go next to the input
+        self.var_output.set(str(out))
+
+        first_col = last_col = None
+        if self.var_columns.get().strip():
+            try:
+                first_col, last_col = _column_range(self.var_columns.get())
+            except argparse.ArgumentTypeError as exc:
+                self._invalid(f"Read columns: {exc}", self.ent_output)
+                return None
+
+        try:
+            skip = int(self.var_skip.get().strip())
+            if skip < 0:
+                raise ValueError
+        except ValueError:
+            self._invalid("Skip header rows must be a whole number, 0 or more.",
+                          self.ent_input)
+            return None
+
+        try:
+            max_cols = int(self.var_max_cols.get().strip())
+            if not 1 <= max_cols <= EXCEL_MAX_COLUMNS:
+                raise ValueError
+        except ValueError:
+            self._invalid(f"Max columns per row must be between 1 and {EXCEL_MAX_COLUMNS}.",
+                          self.ent_input)
+            return None
+
+        fill = self.var_fill.get()
+        if not fill.strip():
+            self._invalid("The fill value must not be empty.", self.ent_input)
+            return None
+
+        cfg = Config(
+            input_path=inp,
+            output_path=out,
+            sheet=self.var_sheet.get() or None,
+            first_col=first_col,
+            last_col=last_col,
+            skip_rows=skip,
+            byte_order=ByteOrder(self.var_byte_order.get()),
+            fill=fill,
+            overflow=_LABEL_TO_OVERFLOW.get(self.var_overflow.get(), Overflow.SPLIT),
+            max_columns=max_cols,
+            report=self.var_report.get(),
+            strict=self.var_strict.get(),
+        )
+
+        targets = output_targets(cfg)
+        existing = [t for t in targets if t.exists()]
+        unconfirmed = [t for t in existing if not _same_path(t, self._confirmed_output)]
+        if unconfirmed:
+            names = "\n".join(f"  {t}" for t in unconfirmed)
+            if not messagebox.askyesno("Replace files?",
+                                       f"These files already exist and will be replaced:"
+                                       f"\n\n{names}\n\nContinue?",
+                                       icon="warning", parent=self.root):
+                return None
+        if existing:
+            cfg = Config(**{**cfg.__dict__, "force": True})
+        return cfg
+
+    # ------------------------------------------------------------------- run
+    def _start(self) -> None:
+        if self.worker is not None and self.worker.is_alive():
+            return
+        cfg = self._collect_config()
+        if cfg is None:
+            return
+        self._clear_log()
+        self.cancel_event.clear()
+        self.last_summary = None
+        self._set_running(True)
+        self.progress.stop()
+        self.progress.configure(mode="determinate", value=0)
+        self.var_progress.set("")
+        self.var_status.set("Working…")
+        self.worker = threading.Thread(target=self._worker, args=(cfg,),
+                                       name="hex-length-filler", daemon=True)
+        self.worker.start()
+
+    def _worker(self, cfg: Config) -> None:
+        last: dict = {"key": None}
+
+        def on_progress(phase: str, done: int, total: int) -> None:
+            key = (phase, int(100 * done / max(1, total)))
+            if key != last["key"]:            # throttle: one message per percent
+                last["key"] = key
+                self.queue.put(("progress", phase, done, total))
+
+        try:
+            summary = run(cfg, progress_cb=on_progress, cancel=self.cancel_event)
+            self.queue.put(("done", summary))
+        except OperationCancelled as exc:
+            LOG.warning("%s", exc)
+            self.queue.put(("cancelled", None))
+        except FillerError as exc:
+            LOG.error("%s", exc)
+            self.queue.put(("failed", str(exc)))
+        except Exception as exc:  # pragma: no cover - last-resort guard
+            LOG.exception("Unexpected error; nothing written.")
+            self.queue.put(("failed", f"Unexpected error: {exc}"))
+
+    def _cancel(self) -> None:
+        if self.worker is not None and self.worker.is_alive():
+            self.cancel_event.set()
+            self.btn_cancel.state(["disabled"])
+            self.var_status.set("Cancelling…")
+
+    def _poll_queue(self) -> None:
+        if self._destroyed:
+            return
+        try:
+            while True:
+                item = self.queue.get_nowait()
+                kind = item[0]
+                if kind == "log":
+                    self._append_log(item[1], item[2])
+                elif kind == "progress":
+                    self._show_progress(*item[1:])
+                else:
+                    self._finish(kind, item[1])
+                    if self._destroyed:
+                        return
+        except queue.Empty:
+            pass
+        self.root.after(GUI_POLL_MS, self._poll_queue)
+
+    def _show_progress(self, phase: str, done: int, total: int) -> None:
+        if phase in ("read", "save"):
+            if str(self.progress.cget("mode")) != "indeterminate":
+                self.progress.configure(mode="indeterminate")
+                self.progress.start(15)
+            if phase == "read":
+                self.var_progress.set("Reading input…")
+            else:
+                self.var_progress.set("Saving file…")
+                self.btn_cancel.state(["disabled"])   # final step cannot be interrupted
+        else:
+            if str(self.progress.cget("mode")) != "determinate":
+                self.progress.stop()
+                self.progress.configure(mode="determinate")
+            pct = int(100 * done / max(1, total))
+            self.progress["value"] = pct
+            self.var_progress.set(f"{pct}%  ({done:,} / {total:,} rows)")
+
+    def _finish(self, kind: str, payload: Any) -> None:
+        self.progress.stop()
+        self.progress.configure(mode="determinate")
+        self._set_running(False)
+        if self._closing:
+            self._destroy()
+            return
+
+        if kind == "done":
+            s: RunSummary = payload
+            self.last_summary = s
+            self.progress["value"] = 100
+            self.var_progress.set("100%")
+            self.btn_open.state(["!disabled"])
+            self.btn_folder.state(["!disabled"])
+            self._append_log(logging.INFO, f"Output saved: {s.output_path}", tag="ok")
+            text = (f"Done in {s.elapsed_s:.1f} s: {s.ok} row(s) converted, "
+                    f"{s.total_cells:,} cells → {s.output_path.name}")
+            if s.invalid:
+                self.var_status.set(text + f"  ({s.invalid} invalid row(s) left blank)")
+                where = "the report file" if s.report_path else (
+                    "the Report sheet" if self.var_report.get() else "the log")
+                messagebox.showwarning(
+                    "Finished with warnings",
+                    f"The output was written, but {s.invalid} input row(s) could not be "
+                    f"read and were left blank.\n\nSee {where} for details.",
+                    parent=self.root)
+            else:
+                self.var_status.set(text)
+        elif kind == "cancelled":
+            self.progress["value"] = 0
+            self.var_progress.set("")
+            self.var_status.set("Cancelled; nothing written.")
+        else:
+            self.progress["value"] = 0
+            self.var_progress.set("")
+            self.var_status.set("Failed; nothing written. See the log.")
+            messagebox.showerror("Conversion failed", str(payload), parent=self.root)
+
+    def _set_running(self, running: bool) -> None:
+        flag = ["disabled"] if running else ["!disabled"]
+        for widget in self._inputs:
+            widget.state(flag)
+        self.btn_run.state(flag)
+        self.btn_cancel.state(["!disabled"] if running else ["disabled"])
+        if running:
+            self.btn_open.state(["disabled"])
+            self.btn_folder.state(["disabled"])
+
+    # ------------------------------------------------------------------- log
+    def _append_log(self, levelno: int, text: str, tag: str = "") -> None:
+        if not tag:
+            tag = "error" if levelno >= logging.ERROR else (
+                "warn" if levelno >= logging.WARNING else "")
+        self.txt_log.configure(state="normal")
+        self.txt_log.insert("end", text + "\n", tag)
+        self.txt_log.see("end")
+        self.txt_log.configure(state="disabled")
+
+    def _clear_log(self) -> None:
+        self.txt_log.configure(state="normal")
+        self.txt_log.delete("1.0", "end")
+        self.txt_log.configure(state="disabled")
+
+    # ----------------------------------------------------------- open / quit
+    def _open_output(self) -> None:
+        self._open(reveal=False)
+
+    def _open_folder(self) -> None:
+        self._open(reveal=True)
+
+    def _open(self, reveal: bool) -> None:
+        if self.last_summary is None:
+            return
+        path = self.last_summary.output_path
+        if not path.exists():
+            messagebox.showerror("File not found", f"{path} no longer exists.", parent=self.root)
+            return
+        try:
+            _open_in_os(path, reveal=reveal)
+        except Exception as exc:
+            messagebox.showerror("Cannot open", f"Could not open {path}:\n{exc}", parent=self.root)
+
+    def _on_close(self) -> None:
+        if self.worker is not None and self.worker.is_alive():
+            if not messagebox.askyesno("Conversion running",
+                                       "A conversion is still running. Cancel it and close?",
+                                       parent=self.root):
+                return
+            self._closing = True
+            self._cancel()
+            return
+        self._destroy()
+
+    def _destroy(self) -> None:
+        self._destroyed = True
+        LOG.removeHandler(self.log_handler)
+        self.root.destroy()
+
+
+def launch_gui(initial_input: Optional[Path] = None,
+               initial_output: Optional[Path] = None) -> int:
+    hint = "Use the command line instead:  python hex_length_filler.py INPUT.xlsx\n"
+    if tk is None:
+        sys.stderr.write(f"The GUI needs tkinter, which this Python lacks "
+                         f"({_TK_IMPORT_ERROR}).\n{hint}")
+        return EXIT_FATAL
+    _enable_windows_dpi_awareness()
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        sys.stderr.write(f"Cannot open the GUI ({exc}).\n{hint}")
+        return EXIT_FATAL
+    if _OPENPYXL_IMPORT_ERROR is not None:
+        root.withdraw()
+        messagebox.showerror("Missing dependency",
+                             "openpyxl is required.\n\nInstall it with:\n    pip install openpyxl",
+                             parent=root)
+        root.destroy()
+        return EXIT_FATAL
+    FillerApp(root, initial_input, initial_output)
+    root.mainloop()
+    return EXIT_OK
+
+
+# --------------------------------------------------------------------------- #
+# Command line
+# --------------------------------------------------------------------------- #
+def _non_negative_int(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"'{text}' is not an integer") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be 0 or greater")
+    return value
+
+
+def _max_columns(text: str) -> int:
+    value = _non_negative_int(text)
+    if not 1 <= value <= EXCEL_MAX_COLUMNS:
+        raise argparse.ArgumentTypeError(f"must be between 1 and {EXCEL_MAX_COLUMNS}")
+    return value
+
+
+def _column_range(text: str) -> Tuple[int, int]:
+    match = re.fullmatch(r"\s*([A-Za-z]{1,3})\s*(?::\s*([A-Za-z]{1,3})\s*)?", text)
+    if not match:
+        raise argparse.ArgumentTypeError(f"'{text}' is not a column like B or B:E")
+    try:
+        first = column_index_from_string(match.group(1).upper())
+        last = column_index_from_string((match.group(2) or match.group(1)).upper())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+    if first > last:
+        raise argparse.ArgumentTypeError(f"'{text}': first column is after the last")
+    return first, last
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="hex_length_filler",
+        description="Read the last two hex bytes of each Excel row as a 16-bit length "
+                    "(LSB first) and write that many filled cells per output row. "
+                    "Run without arguments to open the GUI.",
+        epilog="Examples:\n"
+               "  python hex_length_filler.py                       (GUI)\n"
+               "  python hex_length_filler.py input.xlsx\n"
+               "  python hex_length_filler.py input.xlsx -o result.xlsx --force\n"
+               "  python hex_length_filler.py input.xlsx --columns B --skip-rows 1\n"
+               "  python hex_length_filler.py input.xlsx --overflow wrap\n"
+               "  python hex_length_filler.py input.xlsx -o result.csv",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("input", type=Path, nargs="?",
+                        help="input workbook (.xlsx / .xlsm); omit to open the GUI")
+    parser.add_argument("-o", "--output", type=Path,
+                        help="output .xlsx or .csv (default: <input>_filled.xlsx)")
+    parser.add_argument("--gui", action="store_true",
+                        help="open the GUI (pre-filled with INPUT/--output if given)")
+    parser.add_argument("--sheet", help="input sheet name (default: first sheet)")
+    parser.add_argument("--columns", type=_column_range, metavar="COLS",
+                        help="read only these input columns, e.g. B or B:E (default: whole row)")
+    parser.add_argument("--skip-rows", type=_non_negative_int, default=0, metavar="N",
+                        help="ignore the first N input rows, e.g. a header (default: 0)")
+    parser.add_argument("--byte-order", choices=[e.value for e in ByteOrder],
+                        default=ByteOrder.LITTLE.value,
+                        help="order of the two length bytes: little = LSB first "
+                             "(default), big = MSB first")
+    parser.add_argument("--fill", default="0x00",
+                        help="text written into every output cell (default: 0x00)")
+    parser.add_argument("--overflow", choices=[e.value for e in Overflow],
+                        default=Overflow.SPLIT.value,
+                        help="rows longer than --max-columns: split = same row on extra "
+                             "sheets (default), wrap = following rows, error = abort")
+    parser.add_argument("--max-columns", type=_max_columns, default=EXCEL_MAX_COLUMNS,
+                        metavar="N",
+                        help=f"columns per sheet row, 1..{EXCEL_MAX_COLUMNS} "
+                             f"(default: {EXCEL_MAX_COLUMNS}, the Excel limit)")
+    parser.add_argument("--no-report", action="store_true",
+                        help="do not write the Report sheet (or <output>_report.csv)")
+    parser.add_argument("--strict", action="store_true",
+                        help="abort without writing anything if any row is invalid")
+    parser.add_argument("-f", "--force", action="store_true",
+                        help="overwrite existing output files")
+    verbosity = parser.add_mutually_exclusive_group()
+    verbosity.add_argument("-v", "--verbose", action="store_true", help="debug logging")
+    verbosity.add_argument("-q", "--quiet", action="store_true", help="warnings and errors only")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    return parser
+
+
+def config_from_args(args: argparse.Namespace) -> Config:
+    first_col, last_col = args.columns if args.columns else (None, None)
+    output = args.output or args.input.with_name(f"{args.input.stem}_filled.xlsx")
+    return Config(
+        input_path=args.input,
+        output_path=output,
+        sheet=args.sheet,
+        first_col=first_col,
+        last_col=last_col,
+        skip_rows=args.skip_rows,
+        byte_order=ByteOrder(args.byte_order),
+        fill=args.fill,
+        overflow=Overflow(args.overflow),
+        max_columns=args.max_columns,
+        report=not args.no_report,
+        strict=args.strict,
+        force=args.force,
+    )
+
+
+def _configure_logging(verbose: bool, quiet: bool) -> None:
+    level = logging.DEBUG if verbose else logging.WARNING if quiet else logging.INFO
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT))
+    LOG.handlers[:] = [handler]
+    LOG.setLevel(level)
+    LOG.propagate = False
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv:
+        return launch_gui()
+    args = build_parser().parse_args(argv)
+    if args.gui or args.input is None:
+        return launch_gui(args.input, args.output)
+
+    _configure_logging(args.verbose, args.quiet)
+    if _OPENPYXL_IMPORT_ERROR is not None:
+        LOG.error("openpyxl is required: pip install openpyxl (%s)", _OPENPYXL_IMPORT_ERROR)
+        return EXIT_FATAL
+    try:
+        return run(config_from_args(args)).exit_code
+    except FillerError as exc:
+        LOG.error("%s", exc)
+        return EXIT_FATAL
+    except KeyboardInterrupt:
+        LOG.error("Interrupted; nothing written.")
+        return EXIT_INTERRUPTED
+    except Exception:  # pragma: no cover - last-resort guard
+        LOG.exception("Unexpected error; nothing written.")
+        return EXIT_FATAL
+
+
+if __name__ == "__main__":
+    sys.exit(main())
